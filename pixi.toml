@@ -1,0 +1,80 @@
+[workspace]
+name = "coarse-loftr-trt"
+version = "0.1.0"
+description = "Coarse LoFTR and EfficientLoFTR with TensorRT engines"
+channels = ["conda-forge"]
+platforms = [{ platform = "linux-64", cuda = "12" }]
+
+[dependencies]
+python = "3.11.*"
+numpy = "1.26.4.*"
+py-opencv = "4.10.*"
+matplotlib = "*"
+tqdm = "*"
+yacs = "*"
+git = "*"
+# pytorch-lightning 1.9 still imports pkg_resources
+setuptools = "<75"
+
+# torch and TensorRT match the tracker's `trt` environment (torch 2.4.1 + TensorRT 10.9).
+[pypi-dependencies]
+torch = "==2.4.1"
+tensorrt-cu12 = "==10.9.0.34"
+onnx = "==1.16.2"
+kornia = "==0.7.3"
+einops = "*"
+loguru = "*"
+joblib = "*"
+# Only needed because upstream EfficientLoFTR imports `rank_zero_only` from it.
+pytorch-lightning = "==1.9.5"
+gdown = "*"
+# legacy Coarse LoFTR: webcam.py --onnx and training logs
+onnxruntime-gpu = "==1.22.0"
+tensorboard = "*"
+
+[activation.env]
+PYTHONPATH = "$PIXI_PROJECT_ROOT"
+
+[tasks]
+init-submodules = { cmd = "git submodule update --init --recursive", description = "Fetch the pinned EfficientLoFTR source" }
+download-weights = { cmd = "python -m eloftr.download", description = "Download eloftr_outdoor.ckpt to weights/eloftr" }
+
+[tasks.export-onnx]
+description = "Export a fixed-shape EfficientLoFTR ONNX model"
+args = [
+  { arg = "height", default = "480" },
+  { arg = "width", default = "640" },
+  { arg = "model_type", default = "full" },
+  { arg = "precision", default = "mixed" },
+]
+cmd = "python export_eloftr_onnx.py --height {{ height }} --width {{ width }} --model-type {{ model_type }} --precision {{ precision }}"
+
+[tasks.build-engine]
+description = "Export an ONNX model and build a TensorRT engine for EfficientLoFTR"
+args = [
+  { arg = "height", default = "480" },
+  { arg = "width", default = "640" },
+  { arg = "model_type", default = "full" },
+  { arg = "precision", default = "mixed" },
+]
+cmd = "python build_trt_engine.py --onnx weights/eloftr/eloftr_{{ model_type }}_{{ precision }}_{{ height }}x{{ width }}.onnx"
+depends-on = [{ task = "export-onnx", args = ["{{ height }}", "{{ width }}", "{{ model_type }}", "{{ precision }}"] }]
+
+[tasks.build-default]
+description = "Build the default 640x480 and 384x384 mixed-precision engines"
+depends-on = [
+  { task = "build-engine", args = ["480", "640", "full", "mixed"] },
+  { task = "build-engine", args = ["384", "384", "full", "mixed"] },
+]
+
+[tasks.eval]
+description = "Compare TensorRT engines against the torch EfficientLoFTR (accuracy and speed)"
+cmd = "python eval_eloftr.py"
+
+[tasks.match]
+description = "Match two images and save a visualization"
+cmd = "python match_eloftr.py"
+
+[tasks.build-legacy]
+description = "Build the legacy Coarse LoFTR engine with the pixi TensorRT"
+cmd = "bash export_trt.sh"

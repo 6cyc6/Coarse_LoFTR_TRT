@@ -130,3 +130,13 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# pixi environments
+.pixi/
+
+# Generated EfficientLoFTR weights, ONNX models and engines, and legacy rebuilt engines
+weights/eloftr/
+weights/*.engine
+weights/*.engine.json
+weights/trt_timing.cache
+outputs/
