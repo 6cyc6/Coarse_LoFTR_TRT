@@ -62,10 +62,12 @@ cmd = "python scripts/trt/build_trt_engine.py --onnx weights/eloftr/eloftr_{{ mo
 depends-on = [{ task = "export-onnx", args = ["{{ height }}", "{{ width }}", "{{ model_type }}", "{{ precision }}"] }]
 
 [tasks.build-default]
-description = "Build the default 640x480 and 384x384 mixed-precision engines"
+description = "Build the default 640x480 and 384x384 mixed-precision engines, full and opt"
 depends-on = [
   { task = "build-engine", args = ["480", "640", "full", "mixed"] },
   { task = "build-engine", args = ["384", "384", "full", "mixed"] },
+  { task = "build-engine", args = ["480", "640", "opt", "mixed"] },
+  { task = "build-engine", args = ["384", "384", "opt", "mixed"] },
 ]
 
 [tasks.eval]
