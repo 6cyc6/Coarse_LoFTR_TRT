@@ -10,10 +10,8 @@ import torch.nn.functional as torch_func
 
 from train.mvsdataset import MVSDataset
 from train.saveutils import load_last_checkpoint, save_checkpoint
-from utils import get_coarse_match
 from loftr import LoFTR, default_cfg
-from utils import make_student_config
-from webcam import draw_features
+from loftr.utils.helpers import draw_features, get_coarse_match, make_student_config
 
 
 def tensor_to_image(image):

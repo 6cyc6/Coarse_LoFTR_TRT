@@ -6,9 +6,8 @@ from torch.utils.data import DataLoader
 from loftr.utils.cvpr_ds_config import default_cfg
 from train.mvsdataset import MVSDataset
 from train.settings import TrainSettings
-from utils import make_student_config, get_coarse_match
+from loftr.utils.helpers import draw_features, get_coarse_match, make_student_config
 from trainer import tensor_to_image
-from webcam import draw_features
 
 parser = argparse.ArgumentParser(description='LoFTR knowledge distillation.')
 parser.add_argument('--path', type=str, default='/data_sets/BlendedMVS',

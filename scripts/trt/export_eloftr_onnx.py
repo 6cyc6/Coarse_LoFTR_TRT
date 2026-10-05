@@ -1,21 +1,16 @@
 import argparse
-import hashlib
 import json
 from pathlib import Path
 
 import onnx
 import torch
 
-from eloftr import sidecar_path
+from eloftr import sha256, sidecar_path
 from eloftr.evaluation import compare, load_gray, sample_pairs, static_matches, summarize, to_tensor, upstream_matches
 from eloftr.static_model import StaticELoFTR, precision_groups, precision_label
 from eloftr.upstream import DEFAULT_CKPT, WEIGHTS_DIR, load_upstream, run_upstream, upstream_commit
 
 OUTPUT_NAMES = ['keypoints0', 'keypoints1', 'confidence', 'valid']
-
-
-def sha256(path):
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
 @torch.no_grad()
@@ -73,8 +68,9 @@ def main():
                           opset_version=opt.opset, do_constant_folding=True)
     onnx.checker.check_model(str(out))
 
-    metadata = {'height': opt.height, 'width': opt.width, 'model_type': opt.model_type, 'precision': label,
-                'fp16_groups': list(groups), 'thr': model.thr, 'npe': upstream.config['coarse']['npe'],
+    metadata = {'model': 'eloftr', 'height': opt.height, 'width': opt.width, 'model_type': opt.model_type,
+                'precision': label, 'fp16_groups': list(groups), 'thr': model.thr,
+                'npe': upstream.config['coarse']['npe'],
                 'outputs': OUTPUT_NAMES, 'upstream_commit': upstream_commit(), 'torch': torch.__version__,
                 'opset': opt.opset, 'checkpoint': str(opt.ckpt), 'checkpoint_sha256': sha256(opt.ckpt),
                 'onnx_sha256': sha256(out)}

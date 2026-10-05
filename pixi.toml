@@ -38,6 +38,7 @@ PYTHONPATH = "$PIXI_PROJECT_ROOT"
 [tasks]
 init-submodules = { cmd = "git submodule update --init --recursive", description = "Fetch the pinned EfficientLoFTR source" }
 download-weights = { cmd = "python -m eloftr.download", description = "Download eloftr_outdoor.ckpt to weights/eloftr" }
+download-scannet = { cmd = "bash run/download_scannet.sh", description = "Download the ScanNet-1500 test set to $DATASET_DIR (set in run/env.sh)" }
 
 [tasks.export-onnx]
 description = "Export a fixed-shape EfficientLoFTR ONNX model"
@@ -47,7 +48,7 @@ args = [
   { arg = "model_type", default = "full" },
   { arg = "precision", default = "mixed" },
 ]
-cmd = "python export_eloftr_onnx.py --height {{ height }} --width {{ width }} --model-type {{ model_type }} --precision {{ precision }}"
+cmd = "python scripts/trt/export_eloftr_onnx.py --height {{ height }} --width {{ width }} --model-type {{ model_type }} --precision {{ precision }}"
 
 [tasks.build-engine]
 description = "Export an ONNX model and build a TensorRT engine for EfficientLoFTR"
@@ -57,7 +58,7 @@ args = [
   { arg = "model_type", default = "full" },
   { arg = "precision", default = "mixed" },
 ]
-cmd = "python build_trt_engine.py --onnx weights/eloftr/eloftr_{{ model_type }}_{{ precision }}_{{ height }}x{{ width }}.onnx"
+cmd = "python scripts/trt/build_trt_engine.py --onnx weights/eloftr/eloftr_{{ model_type }}_{{ precision }}_{{ height }}x{{ width }}.onnx"
 depends-on = [{ task = "export-onnx", args = ["{{ height }}", "{{ width }}", "{{ model_type }}", "{{ precision }}"] }]
 
 [tasks.build-default]
@@ -69,12 +70,37 @@ depends-on = [
 
 [tasks.eval]
 description = "Compare TensorRT engines against the torch EfficientLoFTR (accuracy and speed)"
-cmd = "python eval_eloftr.py"
+cmd = "python scripts/eval/eval_eloftr.py"
+
+[tasks.eval-scannet]
+description = "ScanNet-1500 relative pose accuracy and speed of all engines and their torch models"
+cmd = "python scripts/eval/eval_scannet.py"
 
 [tasks.match]
 description = "Match two images and save a visualization"
-cmd = "python match_eloftr.py"
+cmd = "python scripts/match_eloftr.py"
+
+[tasks.export-loftr-onnx]
+description = "Export a fixed-shape original LoFTR (kornia, coarse + fine) ONNX model"
+args = [
+  { arg = "height", default = "480" },
+  { arg = "width", default = "640" },
+  { arg = "pretrained", default = "outdoor" },
+  { arg = "precision", default = "mixed" },
+]
+cmd = "python scripts/trt/export_loftr_onnx.py --height {{ height }} --width {{ width }} --pretrained {{ pretrained }} --precision {{ precision }}"
+
+[tasks.build-loftr-engine]
+description = "Export an ONNX model and build a TensorRT engine for the original LoFTR"
+args = [
+  { arg = "height", default = "480" },
+  { arg = "width", default = "640" },
+  { arg = "pretrained", default = "outdoor" },
+  { arg = "precision", default = "mixed" },
+]
+cmd = "python scripts/trt/build_trt_engine.py --onnx weights/loftr/loftr_{{ pretrained }}_{{ precision }}_{{ height }}x{{ width }}.onnx"
+depends-on = [{ task = "export-loftr-onnx", args = ["{{ height }}", "{{ width }}", "{{ pretrained }}", "{{ precision }}"] }]
 
 [tasks.build-legacy]
 description = "Build the legacy Coarse LoFTR engine with the pixi TensorRT"
-cmd = "bash export_trt.sh"
+cmd = "bash run/export_trt.sh"

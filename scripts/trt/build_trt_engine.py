@@ -10,16 +10,25 @@ from eloftr import sidecar_path
 from eloftr.trt_runtime import TRTEngine, build_engine
 
 
-@torch.no_grad()
-def smoke_test(engine_path, meta, num_pairs=4):
-    """Compare the engine with StaticELoFTR in torch at the same precision."""
-    from eloftr.evaluation import compare, load_gray, sample_pairs, static_matches, summarize, to_tensor
+def reference_model(meta):
+    """Torch model (StaticLoFTR or StaticELoFTR) the ONNX model was exported from, at its precision."""
+    height, width, groups = meta['height'], meta['width'], meta['fp16_groups']
+    if meta.get('model') == 'loftr':
+        from loftr_full.static_model import StaticLoFTR
+        from loftr_full.upstream import load_upstream
+        return StaticLoFTR(load_upstream(meta['pretrained'], meta['checkpoint']), height, width, groups)
     from eloftr.static_model import StaticELoFTR
     from eloftr.upstream import load_upstream
+    return StaticELoFTR(load_upstream(meta['checkpoint'], meta['model_type'], meta['npe']), height, width, groups)
+
+
+@torch.no_grad()
+def smoke_test(engine_path, meta, num_pairs=4):
+    """Compare the engine with the torch model at the same precision."""
+    from eloftr.evaluation import compare, load_gray, sample_pairs, static_matches, summarize, to_tensor
 
     height, width = meta['height'], meta['width']
-    upstream = load_upstream(meta['checkpoint'], meta['model_type'], meta['npe'])
-    model = StaticELoFTR(upstream, height, width, meta['fp16_groups']).cuda().eval()
+    model = reference_model(meta).cuda().eval()
     engine = TRTEngine(engine_path)
     results = []
     for path0, path1 in sample_pairs()[:num_pairs]:
@@ -30,7 +39,7 @@ def smoke_test(engine_path, meta, num_pairs=4):
         ref = static_matches(*model(image0, image1))
         results.append(compare(ref, static_matches(*(out[k] for k in meta['outputs']))))
     summary = summarize(results)
-    print(f'Smoke test vs torch StaticELoFTR ({meta["precision"]}): {summary}')
+    print(f'Smoke test vs torch {type(model).__name__} ({meta["precision"]}): {summary}')
     if summary['jaccard_mean'] < 0.9 or summary['flow_median'] > 0.5:
         raise RuntimeError('TensorRT engine disagrees with the torch model')
     return summary
@@ -42,7 +51,7 @@ def main():
     parser.add_argument('--engine', type=Path, default=None, help='Output engine, default: ONNX path with .engine.')
     parser.add_argument('--fp16', action='store_true',
                         help='Weakly-typed FP16 builder flag for untyped legacy ONNX models (TensorRT 10 only). '
-                             'EfficientLoFTR exports carry their precision in the ONNX types instead.')
+                             'EfficientLoFTR and LoFTR exports carry their precision in the ONNX types instead.')
     parser.add_argument('--tf32', action='store_true', help='Allow TF32 for fp32 layers (lower accuracy).')
     parser.add_argument('--workspace-gib', type=float, default=4.0)
     parser.add_argument('--opt-level', type=int, default=3, help='Builder optimization level 0-5.')
@@ -67,7 +76,7 @@ def main():
                  'gpu': torch.cuda.get_device_name(), 'build_seconds': round(time.perf_counter() - started, 1)})
     print(f'Built {engine_path} in {meta["build_seconds"]} s')
 
-    if 'model_type' in meta and not opt.skip_check:
+    if 'fp16_groups' in meta and not opt.skip_check:  # sidecar of an exported EfficientLoFTR or LoFTR model
         meta['smoke_test'] = smoke_test(engine_path, meta)
     sidecar_path(engine_path).write_text(json.dumps(meta, indent=2))
 

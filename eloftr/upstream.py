@@ -30,7 +30,8 @@ def upstream_commit():
         return None
 
 
-def make_config(model_type='full', npe=None, mp=False):
+def make_config(model_type='full', npe=None, mp=False, thr=None, border_rm=None):
+    """Upstream config; thr and border_rm override the coarse matching threshold and border removal."""
     loftr = import_upstream()
     if model_type == 'full':
         config = deepcopy(loftr.full_default_cfg)
@@ -40,17 +41,21 @@ def make_config(model_type='full', npe=None, mp=False):
         raise ValueError(f'Unknown model type {model_type!r}, choose full or opt')
     if npe is not None:
         config['coarse']['npe'] = list(npe)
+    if thr is not None:
+        config['match_coarse']['thr'] = thr
+    if border_rm is not None:
+        config['match_coarse']['border_rm'] = border_rm
     config['mp'] = mp
     return config
 
 
-def load_upstream(ckpt=DEFAULT_CKPT, model_type='full', npe=None, mp=False, device='cuda'):
+def load_upstream(ckpt=DEFAULT_CKPT, model_type='full', npe=None, mp=False, device='cuda', thr=None, border_rm=None):
     """Upstream LoFTR in eval mode with RepVGG re-parameterization, as in the upstream README."""
     ckpt = Path(ckpt)
     if not ckpt.exists():
         raise FileNotFoundError(f'{ckpt} not found, run: pixi run download-weights')
     loftr = import_upstream()
-    model = loftr.LoFTR(config=make_config(model_type, npe, mp))
+    model = loftr.LoFTR(config=make_config(model_type, npe, mp, thr, border_rm))
     model.load_state_dict(torch.load(ckpt, map_location='cpu')['state_dict'])
     model = loftr.reparameter(model)
     return model.eval().to(device)

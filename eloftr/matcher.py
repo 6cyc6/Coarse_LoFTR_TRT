@@ -22,7 +22,8 @@ class ELoFTRMatcher:
         if engine is not None:
             from eloftr.trt_runtime import TRTEngine
             meta = engine_metadata(engine)
-            self.height, self.width, self.model_type = meta['height'], meta['width'], meta['model_type']
+            # LoFTR engines (loftr_full) share the output contract and have no model_type
+            self.height, self.width, self.model_type = meta['height'], meta['width'], meta.get('model_type')
             self.engine = TRTEngine(engine, device)
             if cuda_graph:
                 self.engine.capture_cuda_graph()

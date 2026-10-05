@@ -3,7 +3,7 @@ from loftr import LoFTR, default_cfg
 import torch
 import torch.nn.utils.prune as prune
 import onnx
-from utils import make_student_config
+from loftr.utils.helpers import make_student_config
 
 
 def main():

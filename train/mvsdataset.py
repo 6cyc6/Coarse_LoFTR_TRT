@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 import re
 
-from utils import make_query_image, ratio_preserving_resize
+from loftr.utils.helpers import make_query_image, ratio_preserving_resize
 
 
 # Dataset parsing routines were taken from https://github.com/YoYo000/MVSNet/

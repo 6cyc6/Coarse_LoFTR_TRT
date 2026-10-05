@@ -27,21 +27,21 @@ class Fp32LayerNorm(nn.LayerNorm):
         return F.layer_norm(x.float(), self.normalized_shape, self.weight, self.bias, self.eps).to(x.dtype)
 
 
-def precision_groups(precision, fp16=None):
+def precision_groups(precision, fp16=None, groups=GROUPS, presets=PRECISIONS):
     """Module groups that run in fp16, from a preset name or an explicit comma-separated list."""
     if fp16 is not None:
-        groups = tuple(g for g in fp16.split(',') if g)
-        unknown = set(groups) - set(GROUPS)
+        selected = tuple(g for g in fp16.split(',') if g)
+        unknown = set(selected) - set(groups)
         if unknown:
-            raise ValueError(f'Unknown fp16 groups {sorted(unknown)}, choose from {GROUPS}')
-        return tuple(g for g in GROUPS if g in groups)
-    if precision not in PRECISIONS:
-        raise ValueError(f'Unknown precision {precision!r}, choose from {list(PRECISIONS)}')
-    return PRECISIONS[precision]
+            raise ValueError(f'Unknown fp16 groups {sorted(unknown)}, choose from {groups}')
+        return tuple(g for g in groups if g in selected)
+    if precision not in presets:
+        raise ValueError(f'Unknown precision {precision!r}, choose from {list(presets)}')
+    return presets[precision]
 
 
-def precision_label(fp16_groups):
-    for name, groups in PRECISIONS.items():
+def precision_label(fp16_groups, presets=PRECISIONS):
+    for name, groups in presets.items():
         if tuple(fp16_groups) == groups:
             return name
     return 'fp16-' + '-'.join(fp16_groups)
@@ -53,7 +53,7 @@ def _logsumexp(x, dim):
     return m + torch.log(torch.exp(x - m).sum(dim=dim, keepdim=True))
 
 
-def _cast_module(module, dtype):
+def cast_module(module, dtype):
     """Cast parameters and floating buffers to dtype, keeping LayerNorms in fp32."""
     for m in module.modules():
         if isinstance(m, nn.LayerNorm):
@@ -98,9 +98,9 @@ class StaticELoFTR(nn.Module):
         self.height, self.width = height, width
         self.fp16_groups = tuple(fp16_groups)
         self.dtypes = {g: torch.float16 if g in self.fp16_groups else torch.float32 for g in GROUPS}
-        _cast_module(self.backbone, self.dtypes['backbone'])
-        _cast_module(self.loftr_coarse, self.dtypes['coarse'])
-        _cast_module(self.fine_preprocess, self.dtypes['fine'])
+        cast_module(self.backbone, self.dtypes['backbone'])
+        cast_module(self.loftr_coarse, self.dtypes['coarse'])
+        cast_module(self.fine_preprocess, self.dtypes['fine'])
 
         match_coarse = config['match_coarse']
         self.thr = match_coarse['thr']

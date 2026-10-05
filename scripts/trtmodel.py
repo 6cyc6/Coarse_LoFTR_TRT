@@ -14,5 +14,6 @@ class TRTModel:
 
     def __call__(self, left_image: np.ndarray, right_image: np.ndarray):
         left, right = (torch.from_numpy(np.ascontiguousarray(x, dtype=self.dtype)) for x in (left_image, right_image))
+        # outputs in ONNX order: conf_matrix, then the raw similarity matrix
         outputs = list(self.engine(left, right).values())
-        return outputs[1].cpu().numpy().ravel()
+        return outputs[0].cpu().numpy().ravel()

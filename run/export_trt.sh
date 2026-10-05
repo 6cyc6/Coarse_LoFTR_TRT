@@ -5,4 +5,4 @@
 ONNX_MODEL=weights/LoFTR_teacher.onnx
 TRT_MODEL=weights/LoFTR_teacher.engine
 
-python build_trt_engine.py --onnx=$ONNX_MODEL --engine=$TRT_MODEL --fp16 --workspace-gib=8 "$@"
+python scripts/trt/build_trt_engine.py --onnx=$ONNX_MODEL --engine=$TRT_MODEL --fp16 --workspace-gib=8 "$@"

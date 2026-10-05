@@ -5,7 +5,7 @@ import cv2
 import numpy as np
 from camera import Camera
 from loftr.utils.cvpr_ds_config import default_cfg
-from utils import make_query_image, get_coarse_match, make_student_config
+from loftr.utils.helpers import draw_features, get_coarse_match, make_query_image, make_student_config
 
 
 def main():
@@ -180,18 +180,6 @@ def draw_fps(time_diff, image):
 def draw_inference(time_diff, image):
     fps_str = f'Inference: {time_diff:.2} s'
     cv2.putText(image, fps_str, (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (200, 200, 200), 2, cv2.LINE_AA)
-
-
-def draw_features(image, features, img_size, color, draw_text=True):
-    indices = range(len(features))
-    sx = image.shape[1] / img_size[0]
-    sy = image.shape[0] / img_size[1]
-
-    for i, point in zip(indices, features):
-        point_int = (int(round(point[0] * sx)), int(round(point[1] * sy)))
-        cv2.circle(image, point_int, 2, color, -1, lineType=16)
-        if draw_text:
-            cv2.putText(image, str(i), point_int, cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
 
 
 if __name__ == "__main__":
