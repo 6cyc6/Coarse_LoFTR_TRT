@@ -30,7 +30,7 @@ Scripts import the packages from the repository root, which pixi puts on `PYTHON
 ### EfficientLoFTR + TensorRT
 
 [EfficientLoFTR](https://github.com/zju3dv/EfficientLoFTR) is included as an unmodified, pinned git submodule in `third_party/EfficientLoFTR` (note its Project Registration License: research use is free, project use requires registration).
-The `eloftr` package wraps it into `StaticELoFTR`, a fixed-shape version of the model for ONNX/TensorRT export: it reuses the upstream backbone, coarse transformer and fine FPN weights, and re-implements the coarse/fine matching without data-dependent shapes. Every coarse cell of the first image gets a candidate match, and a `valid` mask marks the matches upstream returns.
+The `eloftr` package wraps it into `StaticELoFTR`, a fixed-shape version of the model for ONNX/TensorRT export: it reuses the upstream backbone, coarse transformer and fine FPN weights, and re-implements the coarse/fine matching without data-dependent shapes. Every coarse cell of the first image gets a candidate match, and a `valid` mask marks the matches upstream returns. Only cells outside upstream's border removal can be valid, so only they are refined at the fine level (exact; 8% faster at 384x384, 4% at 640x480).
 
 ```
 pixi run download-weights   # weights/eloftr/eloftr_outdoor.ckpt
@@ -41,7 +41,7 @@ pixi run match <image0> <image1> --engine weights/eloftr/eloftr_full_mixed_480x6
 
 Engines for other sizes (multiples of 32), model types and precisions are built with `pixi run build-engine <height> <width> <full|opt> <mixed|fp32>`.
 
-* `full` uses dual-softmax coarse matching (upstream default, recommended); `opt` thresholds the raw similarity at 25 instead (upstream "optimized" setting, same checkpoint). In TensorRT `opt` is 16% faster than `full` at 640x480 and 5% faster at 384x384. It is as accurate as `full` on the sample-image homographies, but about 2.5 AUC points lower on ScanNet-1500 (see below), as upstream `opt` in torch is. Upstream computes the `opt` coarse similarity in fp16 under mixed precision; `StaticELoFTR` keeps it in fp32 for both model types.
+* `full` uses dual-softmax coarse matching (upstream default, recommended); `opt` thresholds the raw similarity at 25 instead (upstream "optimized" setting, same checkpoint). In TensorRT `opt` is 14% faster than `full` at 640x480 and 8% faster at 384x384. It is as accurate as `full` on the sample-image homographies, but about 2.5 AUC points lower on ScanNet-1500 (see below), as upstream `opt` in torch is. Upstream computes the `opt` coarse similarity in fp16 under mixed precision; `StaticELoFTR` keeps it in fp32 for both model types.
 * `mixed` runs the backbone, transformer and fine FPN in fp16, and the coarse similarity, fine-window matmuls, LayerNorms and all softmaxes in fp32. Keeping the small fine-window matmuls in fp32 matters: in fp16 their rounded outputs create ties in the fine argmax that measurably lower the keypoint accuracy, at no speed gain. The precision is expressed by casts in the exported ONNX, which is built as a strongly-typed TensorRT network (the only mode in TensorRT 11) with TF32 disabled. `scripts/trt/export_eloftr_onnx.py --fp16 backbone,coarse,fine,fine_matching` selects the fp16 module groups explicitly.
 * Engine outputs: `keypoints0`, `keypoints1` (`[L, 2]`, pixels of the engine input), `confidence` (`[L]`) and `valid` (`[L]`, bool), with `L = H/8 * W/8`. `eloftr.matcher.ELoFTRMatcher` resizes the input images, filters the matches and maps them back to the original image size.
 * Every ONNX model and engine has a JSON sidecar (`*.onnx.json`, `*.engine.json`) with its shape, precision and versions. Engines only load with the TensorRT version that built them, so rebuild them from the ONNX models for other TensorRT versions.
@@ -52,18 +52,18 @@ Results on an RTX 4070 Ti SUPER (`pixi run eval`, latency of image tensors on th
 
 | Model | Size | Latency | Matches | H@1px | H@3px | H error |
 |---|---|---|---|---|---|---|
-| `full` torch upstream fp32 | 640x480 | 29.4 ms | 459 | 0.9710 | 0.9950 | 0.337 px |
-| `full` torch upstream mixed precision (`mp`) | 640x480 | 24.3 ms | 459 | 0.9699 | 0.9950 | 0.337 px |
-| `full` TensorRT mixed | 640x480 | 11.8 ms | 460 | 0.9715 | 0.9950 | 0.335 px |
-| `opt` torch upstream fp32 | 640x480 | 24.7 ms | 436 | 0.9733 | 0.9949 | 0.331 px |
-| `opt` torch upstream `mp` | 640x480 | 17.3 ms | 437 | 0.9724 | 0.9950 | 0.332 px |
-| `opt` TensorRT mixed | 640x480 | 10.3 ms | 436 | 0.9736 | 0.9949 | 0.329 px |
-| `full` torch upstream fp32 | 384x384 | 14.2 ms | 212 | 0.9680 | 0.9941 | 0.343 px |
-| `full` torch upstream `mp` | 384x384 | 11.4 ms | 212 | 0.9679 | 0.9939 | 0.343 px |
-| `full` TensorRT mixed | 384x384 | 5.2 ms | 212 | 0.9687 | 0.9940 | 0.341 px |
+| `full` torch upstream fp32 | 640x480 | 29.2 ms | 459 | 0.9710 | 0.9950 | 0.337 px |
+| `full` torch upstream mixed precision (`mp`) | 640x480 | 22.8 ms | 459 | 0.9699 | 0.9950 | 0.337 px |
+| `full` TensorRT mixed | 640x480 | 11.3 ms | 460 | 0.9715 | 0.9950 | 0.335 px |
+| `opt` torch upstream fp32 | 640x480 | 24.4 ms | 436 | 0.9733 | 0.9949 | 0.331 px |
+| `opt` torch upstream `mp` | 640x480 | 17.2 ms | 437 | 0.9724 | 0.9950 | 0.332 px |
+| `opt` TensorRT mixed | 640x480 | 9.7 ms | 436 | 0.9736 | 0.9949 | 0.329 px |
+| `full` torch upstream fp32 | 384x384 | 14.1 ms | 212 | 0.9680 | 0.9941 | 0.343 px |
+| `full` torch upstream `mp` | 384x384 | 10.7 ms | 212 | 0.9679 | 0.9939 | 0.343 px |
+| `full` TensorRT mixed | 384x384 | 4.8 ms | 212 | 0.9687 | 0.9940 | 0.341 px |
 | `opt` torch upstream fp32 | 384x384 | 13.1 ms | 186 | 0.9706 | 0.9936 | 0.337 px |
-| `opt` torch upstream `mp` | 384x384 | 9.6 ms | 186 | 0.9702 | 0.9933 | 0.337 px |
-| `opt` TensorRT mixed | 384x384 | 4.9 ms | 185 | 0.9708 | 0.9935 | 0.336 px |
+| `opt` torch upstream `mp` | 384x384 | 9.5 ms | 186 | 0.9702 | 0.9933 | 0.337 px |
+| `opt` TensorRT mixed | 384x384 | 4.5 ms | 185 | 0.9708 | 0.9935 | 0.336 px |
 
 H@1px/H@3px: fraction of matches within 1/3 px of the ground truth on the synthetic homographies, H error: mean error of the matches within 5 px. Note that the fine-level argmax picks one pixel pair inside an 8x8 window and is sensitive to precision: upstream's own default inference (fine-level einsums under fp16 autocast) already moves about 11% of the matches by more than 1 px relative to an all-fp32 run, without changing the accuracy. The TensorRT `mixed` engines stay within that variation.
 
@@ -104,7 +104,7 @@ Results on an RTX 4070 Ti SUPER (`pixi run eval-scannet --paper`, about 30 minut
 |---|---|---|---|---|---|---|
 | EfficientLoFTR torch fp32 | 950 | 19.86 | 37.68 | 53.99 | 72.40 | 30.0 ms |
 | EfficientLoFTR torch mixed precision (`mp`) | 950 | 19.78 | 37.91 | 54.48 | 72.39 | 22.6 ms |
-| EfficientLoFTR TensorRT mixed | 952 | 19.88 | 37.78 | 54.16 | 72.31 | 11.8 ms |
+| EfficientLoFTR TensorRT mixed | 952 | 19.88 | 37.78 | 54.16 | 72.31 | 11.2 ms¹ |
 | LoFTR outdoor, kornia fp32 | 812 | 17.57 | 34.45 | 50.60 | 69.82 | 51.3 ms |
 | LoFTR outdoor, TensorRT fp32 | 812 | 17.46 | 34.30 | 50.56 | 69.82 | 51.5 ms |
 | LoFTR outdoor, TensorRT mixed | 812 | 17.40 | 34.19 | 50.45 | 69.83 | 24.8 ms |
@@ -114,27 +114,28 @@ Results on an RTX 4070 Ti SUPER (`pixi run eval-scannet --paper`, about 30 minut
 | LoFTR indoor_new (ScanNet weights), kornia fp32 (`--paper`) | 962 | 21.69 | 40.62 | 57.57 | 88.11 | 53.9 ms |
 
 * The engines bake in the default matching settings of their model (threshold 0.2, border removal 2), and the first eight rows use them. The published EfficientLoFTR ScanNet result, 19.2/37.0/53.6 ([paper](https://arxiv.org/abs/2403.04765), Table 1), uses threshold 0.1 without border removal; it and the published LoFTR results (outdoor weights 16.9/33.6/50.6 in the same table, ScanNet weights 22.06/40.80/57.62 in the LoFTR paper) are reproduced within 0.9 AUC points; for scale, torch fp32 and `mp` of the same model differ by up to 0.5.
-* The TensorRT engines are within 0.3 AUC points and 0.2% of the match count of their torch models, at 2.5x (EfficientLoFTR, vs torch fp32) and 2.1x (LoFTR mixed) the speed.
+* The TensorRT engines are within 0.3 AUC points and 0.2% of the match count of their torch models, at 2.7x (EfficientLoFTR, vs torch fp32) and 2.1x (LoFTR mixed) the speed.
+* ¹ Measured with the full vs opt run below, after the fine stage was restricted to the interior cells (11.8 ms before, same matches).
 * The Coarse LoFTR student matches cells of its 1/16 coarse grid (16 px) without refinement, which the 0.5 px RANSAC threshold of the protocol does not tolerate.
 
 EfficientLoFTR `full` and `opt` at both engine sizes (`pixi run eval-scannet --engine weights/eloftr/*.engine`, a separate run; the 384x384 rows resize the 640x480 images to 384x384 and map the matches back):
 
 | Model | Size | Matches | AUC@5 | AUC@10 | AUC@20 | P@5e-4 | Latency |
 |---|---|---|---|---|---|---|---|
-| `full` torch fp32 | 640x480 | 950 | 19.62 | 37.64 | 54.05 | 72.40 | 29.8 ms |
-| `full` torch `mp` | 640x480 | 950 | 19.79 | 37.91 | 54.53 | 72.39 | 23.2 ms |
-| `full` TensorRT mixed | 640x480 | 952 | 19.88 | 37.78 | 54.16 | 72.31 | 12.1 ms |
-| `opt` torch fp32 | 640x480 | 1057 | 18.22 | 35.62 | 51.88 | 69.74 | 25.5 ms |
-| `opt` torch `mp` | 640x480 | 1061 | 18.41 | 35.97 | 52.23 | 69.72 | 17.2 ms |
-| `opt` TensorRT mixed | 640x480 | 1057 | 18.26 | 35.53 | 51.77 | 69.72 | 10.2 ms |
-| `full` torch fp32 | 384x384 | 500 | 18.49 | 35.82 | 52.47 | 71.62 | 14.3 ms |
-| `full` torch `mp` | 384x384 | 500 | 18.78 | 36.24 | 52.81 | 71.62 | 10.9 ms |
-| `full` TensorRT mixed | 384x384 | 501 | 18.22 | 35.83 | 52.60 | 71.55 | 5.3 ms |
-| `opt` torch fp32 | 384x384 | 517 | 17.02 | 33.41 | 49.23 | 69.81 | 12.6 ms |
-| `opt` torch `mp` | 384x384 | 518 | 17.12 | 33.57 | 49.45 | 69.74 | 10.7 ms |
-| `opt` TensorRT mixed | 384x384 | 517 | 17.21 | 34.04 | 50.08 | 69.87 | 5.0 ms |
+| `full` torch fp32 | 640x480 | 950 | 19.86 | 37.68 | 53.99 | 72.40 | 29.4 ms |
+| `full` torch `mp` | 640x480 | 950 | 19.78 | 37.91 | 54.48 | 72.39 | 22.5 ms |
+| `full` TensorRT mixed | 640x480 | 952 | 19.88 | 37.78 | 54.16 | 72.31 | 11.2 ms |
+| `opt` torch fp32 | 640x480 | 1057 | 17.99 | 35.37 | 51.82 | 69.74 | 24.4 ms |
+| `opt` torch `mp` | 640x480 | 1061 | 18.46 | 36.03 | 52.26 | 69.72 | 16.9 ms |
+| `opt` TensorRT mixed | 640x480 | 1057 | 18.26 | 35.53 | 51.77 | 69.72 | 9.7 ms |
+| `full` torch fp32 | 384x384 | 500 | 18.60 | 36.12 | 52.67 | 71.64 | 13.5 ms |
+| `full` torch `mp` | 384x384 | 500 | 18.08 | 35.84 | 52.57 | 71.60 | 10.7 ms |
+| `full` TensorRT mixed | 384x384 | 501 | 18.22 | 35.83 | 52.60 | 71.55 | 4.9 ms |
+| `opt` torch fp32 | 384x384 | 517 | 16.99 | 33.48 | 49.31 | 69.82 | 12.4 ms |
+| `opt` torch `mp` | 384x384 | 518 | 16.98 | 33.68 | 49.65 | 69.78 | 9.6 ms |
+| `opt` TensorRT mixed | 384x384 | 517 | 17.21 | 34.04 | 50.08 | 69.87 | 4.5 ms |
 
-The `opt` engines stay within 0.9 AUC points and 0.1% of the match count of torch `opt`. `opt` returns about 10% more matches than `full` at a lower precision and loses 2.4-2.5 AUC@20 points, so `full` remains the recommended model type.
+The engines stay within 0.8 AUC points and 0.2% of the match count of their torch models; the torch rows themselves vary by up to 0.7 points between runs. `opt` returns about 10% more matches than `full` at a lower precision and loses 2.2-3.4 AUC@20 points across these rows, so `full` remains the recommended model type.
 * LoFTR with the ScanNet weights finds no matches on 73 of the 1500 pairs; they count as failed poses, as upstream does.
 
 ### Model weights

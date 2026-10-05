@@ -121,6 +121,8 @@ class StaticELoFTR(nn.Module):
         border = (rows >= b) & (rows < self.hc - b) & (cols >= b) & (cols < self.wc - b) if b > 0 else torch.ones(n, dtype=torch.bool)
         self.register_buffer('border', border, persistent=False)
         self.register_buffer('cell_ids', torch.arange(n), persistent=False)
+        # only cells outside the border removal can be valid matches, so only they are refined at the fine level
+        self.register_buffer('interior', self.cell_ids[border], persistent=False)
         # coarse keypoints: [i % w, i // w] * scale
         self.register_buffer('coords_c', torch.stack([cols, rows], 1).float() * stride, persistent=False)
 
@@ -154,7 +156,8 @@ class StaticELoFTR(nn.Module):
         Args:
             image0, image1: [1, 1, H, W] grayscale images in [0, 1]
         Returns:
-            keypoints0, keypoints1: [L, 2] (x, y) in input pixels, L = H/8 * W/8 (one candidate per coarse cell of image0)
+            keypoints0, keypoints1: [L, 2] (x, y) in input pixels, L = H/8 * W/8 (one candidate per coarse cell of image0;
+                cells within the border removal are never valid and keep their coarse positions)
             confidence: [L] coarse confidence (dual-softmax score, or raw similarity for the opt model)
             valid: [L] bool, True for the matches upstream would return
         """
@@ -189,13 +192,16 @@ class StaticELoFTR(nn.Module):
         feat_f = self.fine_preprocess.inter_fpn(feat_c.to(dtype), feats['feats_x2'].to(dtype),
                                                 feats['feats_x1'].to(dtype), self.stride)
         cf = feat_f.shape[1]
-        win, n = self.win, self.hc * self.wc
-        # image0: non-overlapping win x win windows, ordered like F.unfold (row-major inside the window)
+        win, n, m = self.win, self.hc * self.wc, len(self.interior)
+        # image0: non-overlapping win x win windows of the interior cells, ordered like F.unfold (row-major inside
+        # the window)
         win0 = feat_f[0].reshape(cf, self.hc, win, self.wc, win).permute(1, 3, 2, 4, 0).reshape(n, win * win, cf)
-        # image1: (win+2)^2 windows around the matched coarse cells j
+        win0 = win0.index_select(0, self.interior)
+        # image1: (win+2)^2 windows around their matched coarse cells j
+        j_interior = j_ids[self.interior]
         padded = F.pad(feat_f[1], (1, 1, 1, 1)).flatten(1).transpose(0, 1)
-        index = (self.window_base[j_ids][:, None] + self.window_offsets[None]).reshape(-1)
-        win1 = padded.index_select(0, index).reshape(n, (win + 2) ** 2, cf)
+        index = (self.window_base[j_interior][:, None] + self.window_offsets[None]).reshape(-1)
+        win1 = padded.index_select(0, index).reshape(m, (win + 2) ** 2, cf)
 
         # 5. fine matching (upstream FineMatching). The argmax of the dual softmax is taken in log space,
         # argmax(softmax_1 * softmax_2) = argmax(2 x - logsumexp_1 - logsumexp_2), saving the two products.
@@ -204,13 +210,15 @@ class StaticELoFTR(nn.Module):
         conf_f = torch.matmul(win0[..., :-s] / cf ** .5, (win1[..., :-s] / cf ** .5).transpose(1, 2)).float()
         conf_ff = torch.matmul(win0[..., -s:], (win1[..., -s:] / s ** .5).transpose(1, 2))
         score_f = 2 * conf_f - _logsumexp(conf_f, 1) - _logsumexp(conf_f, 2)
-        score_f = score_f.reshape(n, win * win, win + 2, win + 2)[..., 1:-1, 1:-1].reshape(n, -1)
+        score_f = score_f.reshape(m, win * win, win + 2, win + 2)[..., 1:-1, 1:-1].reshape(m, -1)
         idx = score_f.argmax(dim=1)
 
-        heatmap = torch.gather(conf_ff.reshape(n, -1), 1, self.ff_index[idx]).float()
+        heatmap = torch.gather(conf_ff.reshape(m, -1), 1, self.ff_index[idx]).float()
         heatmap = F.softmax(heatmap / self.regress_temperature, -1)
         coords = torch.matmul(heatmap, self.expect_xy)
 
-        keypoints0 = self.coords_c + self.delta_l[idx]
-        keypoints1 = self.coords_c[j_ids] + self.delta_r[idx] + coords
+        # refined keypoints of the interior cells; border cells (never valid) keep their coarse positions
+        rows = self.interior[:, None].expand(-1, 2)
+        keypoints0 = self.coords_c.scatter(0, rows, self.coords_c[self.interior] + self.delta_l[idx])
+        keypoints1 = self.coords_c[j_ids].scatter(0, rows, self.coords_c[j_interior] + self.delta_r[idx] + coords)
         return keypoints0, keypoints1, confidence, valid
