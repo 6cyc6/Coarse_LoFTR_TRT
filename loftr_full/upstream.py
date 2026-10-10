@@ -32,7 +32,7 @@ def load_upstream(pretrained='outdoor', ckpt=None, device='cuda'):
     if ckpt is None:
         state = torch.hub.load_state_dict_from_url(urls[pretrained], model_dir=str(WEIGHTS_DIR), map_location='cpu')
     else:
-        state = torch.load(ckpt, map_location='cpu')
+        state = torch.load(ckpt, map_location='cpu', weights_only=False)  # Lightning checkpoints pickle objects
     model.load_state_dict(state['state_dict'])
     return model.eval().to(device)
 

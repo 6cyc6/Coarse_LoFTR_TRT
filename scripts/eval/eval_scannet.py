@@ -1,5 +1,5 @@
-"""ScanNet-1500 relative pose benchmark: accuracy and speed of EfficientLoFTR, LoFTR and Coarse LoFTR, in torch and
-TensorRT.
+"""ScanNet-1500 relative pose benchmark: accuracy and speed of EfficientLoFTR, LoFTR, Coarse LoFTR, LoMa and RoMa v2,
+in torch and TensorRT.
 
 Follows the upstream EfficientLoFTR ScanNet test (third_party/EfficientLoFTR/scripts/reproduce_test/indoor_full_auc.sh):
 the 1500 pairs are resized to 640x480, the essential matrix is estimated with OpenCV RANSAC (0.5 px, confidence
@@ -10,7 +10,8 @@ per pair with CUDA events, from the images on the GPU to the filtered matches.
 Every TensorRT engine is compared with the torch model it was exported from, at the same input size and matching
 settings (the engine's thr and border removal, upstream defaults 0.2 and 2). The upstream ScanNet results use other
 settings for EfficientLoFTR (thr 0.1, no border removal, mixed precision) and the ScanNet-trained LoFTR weights;
---paper adds these two torch rows.
+--paper adds these two torch rows. LoMa and RoMa v2 engines are compared with upstream in its default (bf16) mixed
+precision on the same RGB inputs; RoMa v2 matches are sampled with upstream's sampler from a fixed seed.
 """
 import argparse
 import json
@@ -33,6 +34,8 @@ from eloftr.upstream import DEFAULT_CKPT, UPSTREAM_DIR, WEIGHTS_DIR as ELOFTR_WE
 ROOT = Path(__file__).resolve().parents[2]
 ASSETS = UPSTREAM_DIR / 'assets' / 'scannet_test_1500'
 LOFTR_WEIGHTS = ROOT / 'weights' / 'loftr'
+LOMA_WEIGHTS = ROOT / 'weights' / 'loma'
+ROMAV2_WEIGHTS = ROOT / 'weights' / 'romav2'
 LEGACY_ENGINE = ROOT / 'weights' / 'LoFTR_teacher.engine'
 LEGACY_WEIGHTS = ROOT / 'weights' / 'LoFTR_teacher.pt'
 HEIGHT, WIDTH = 480, 640  # resolution of the ScanNet intrinsics; keypoints are mapped back to it
@@ -65,10 +68,10 @@ def load_pairs(data_root):
 
 
 class PairImages(Dataset):
-    """Grayscale uint8 images of a pair resized to the method input size, like upstream read_scannet_gray."""
+    """uint8 images of a pair resized to the method input size: grayscale like upstream read_scannet_gray, or RGB."""
 
-    def __init__(self, pairs, height, width):
-        self.pairs, self.size = pairs, (width, height)
+    def __init__(self, pairs, height, width, color=False):
+        self.pairs, self.size, self.color = pairs, (width, height), color
 
     def __len__(self):
         return len(self.pairs)
@@ -76,19 +79,23 @@ class PairImages(Dataset):
     def __getitem__(self, index):
         images = []
         for key in ('image0', 'image1'):
-            image = cv2.imread(str(self.pairs[index][key]), cv2.IMREAD_GRAYSCALE)
+            image = cv2.imread(str(self.pairs[index][key]), cv2.IMREAD_COLOR if self.color else cv2.IMREAD_GRAYSCALE)
             if image is None:
                 raise FileNotFoundError(self.pairs[index][key])
-            images.append(torch.from_numpy(cv2.resize(image, self.size)))
+            image = cv2.resize(image, self.size)
+            images.append(torch.from_numpy(cv2.cvtColor(image, cv2.COLOR_BGR2RGB) if self.color else image))
         return images
 
 
 class Method:
-    """A matcher at a fixed input size. `load()` returns match(image0, image1) for [1, 1, H, W] float CUDA images in
-    [0, 1] -> (kpts0, kpts1 [M, 2] in input pixels, conf [M]); TensorRT methods name their torch `reference`."""
+    """A matcher at a fixed input size. `load()` returns match(image0, image1) for [1, C, H, W] float CUDA images in
+    [0, 1] (grayscale, or RGB if `color`) -> (kpts0, kpts1 [M, 2] in input pixels, conf [M]); TensorRT methods name
+    their torch `reference`. Keypoints of `pixel_center` 0.5 methods are OpenCV pixels (centres at integers), rescaled
+    exactly to the intrinsics frame; the others are scaled about the image origin as upstream EfficientLoFTR does."""
 
-    def __init__(self, name, height, width, load, reference=None):
+    def __init__(self, name, height, width, load, reference=None, color=False, pixel_center=0.0):
         self.name, self.height, self.width, self.load, self.reference = name, height, width, load, reference
+        self.color, self.pixel_center = color, pixel_center
 
 
 def size_suffix(height, width):
@@ -146,6 +153,76 @@ def static_engine(path, cuda_graph):
     return Method(name, height, width, load, reference.name), reference
 
 
+def loma_torch(variant, height, width, num_keypoints):
+    """Upstream LoMa in its default mixed precision (bf16 autocast) on the RGB images, as its tensor API matches."""
+    def load():
+        from loma_trt.upstream import load_upstream, run_upstream, to_pixels
+        model = load_upstream(variant)
+
+        def match(image0, image1):
+            out = run_upstream(model, image0, image1, num_keypoints)
+            valid = out['matches0'] > -1
+            kpts0 = to_pixels(out['keypoints0'][valid], height, width)
+            kpts1 = to_pixels(out['keypoints1'][out['matches0'][valid]], height, width)
+            return kpts0, kpts1, out['scores0'][valid]
+        return match
+    name = f'loma {variant} torch mp{size_suffix(height, width)}'
+    return Method(name, height, width, load, color=True, pixel_center=0.5)
+
+
+def loma_engine(path, cuda_graph):
+    meta = engine_metadata(path)
+    height, width = meta['height'], meta['width']
+
+    def load():
+        engine = TRTEngine(path)
+        if cuda_graph:
+            engine.capture_cuda_graph()
+
+        def match(image0, image1):
+            out = engine(image0, image1)
+            keypoints0, keypoints1, confidence, valid = (out[k] for k in meta['outputs'])
+            return keypoints0[valid], keypoints1[valid], confidence[valid]
+        return match
+    reference = loma_torch(meta['variant'], height, width, meta['num_keypoints'])
+    name = f'loma {meta["variant"]} trt {meta["precision"]}{size_suffix(height, width)}'
+    return Method(name, height, width, load, reference.name, color=True, pixel_center=0.5), reference
+
+
+def romav2_torch(height, width, bidirectional, num_matches):
+    """Upstream RoMa v2 forward in its default mixed precision (bf16), matches sampled with upstream's sampler."""
+    def load():
+        from romav2_trt.evaluation import upstream_outputs
+        from romav2_trt.matcher import sample_matches
+        from romav2_trt.upstream import load_upstream, run_upstream
+        model = load_upstream(bidirectional=bidirectional)
+
+        def match(image0, image1):
+            return sample_matches(upstream_outputs(run_upstream(model, image0, image1)), num_matches)
+        return match
+    name = f'romav2{" bidir" if bidirectional else ""} torch mp{size_suffix(height, width)}'
+    return Method(name, height, width, load, color=True, pixel_center=0.5)
+
+
+def romav2_engine(path, cuda_graph, num_matches):
+    meta = engine_metadata(path)
+    height, width = meta['height'], meta['width']
+
+    def load():
+        from romav2_trt.matcher import sample_matches
+        engine = TRTEngine(path)
+        if cuda_graph:
+            engine.capture_cuda_graph()
+
+        def match(image0, image1):
+            out = engine(image0, image1)
+            return sample_matches(tuple(out[k] for k in meta['outputs']), num_matches)
+        return match
+    reference = romav2_torch(height, width, meta['bidirectional'], num_matches)
+    name = f'romav2{" bidir" if meta["bidirectional"] else ""} trt {meta["precision"]}{size_suffix(height, width)}'
+    return Method(name, height, width, load, reference.name, color=True, pixel_center=0.5), reference
+
+
 def coarse_matches(conf_matrix, width, stride):
     """loftr.utils.helpers.get_coarse_match on the GPU: every entry of the [1, L, S] confidence above 0.01."""
     _, i, j = torch.nonzero(conf_matrix > LEGACY_CONF_THR, as_tuple=True)
@@ -199,12 +276,17 @@ def make_methods(opt):
     """TensorRT engines, each preceded by its torch model (EfficientLoFTR also in upstream mixed precision)."""
     engines = opt.engine if opt.engine is not None else (
         sorted(ELOFTR_WEIGHTS.glob('*.engine')) + sorted(LOFTR_WEIGHTS.glob('*.engine'))
+        + sorted(LOMA_WEIGHTS.glob('*.engine')) + sorted(ROMAV2_WEIGHTS.glob('*.engine'))
         + ([LEGACY_ENGINE] if LEGACY_ENGINE.exists() else []))
     methods = {}
     for path in engines:
         meta = engine_metadata(path)
         if meta.get('model') in ('eloftr', 'loftr'):
             method, reference = static_engine(path, opt.cuda_graph)
+        elif meta.get('model') == 'loma':
+            method, reference = loma_engine(path, opt.cuda_graph)
+        elif meta.get('model') == 'romav2':
+            method, reference = romav2_engine(path, opt.cuda_graph, opt.romav2_matches)
         else:
             method, reference = legacy_engine(path, opt.cuda_graph)
         if not opt.no_torch:
@@ -224,13 +306,16 @@ def make_methods(opt):
 def run_matching(method, pairs, opt):
     """Matches of every pair in the 640x480 frame of the intrinsics, and the latency of each pair in ms."""
     match = method.load()
-    loader = DataLoader(PairImages(pairs, method.height, method.width), batch_size=None, num_workers=opt.workers,
-                        pin_memory=True)
+    loader = DataLoader(PairImages(pairs, method.height, method.width, method.color), batch_size=None,
+                        num_workers=opt.workers, pin_memory=True)
     scale = np.array([WIDTH / method.width, HEIGHT / method.height], dtype=np.float32)
+    center = method.pixel_center
     start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     matches, times = [], []
     for index, images in enumerate(loader):
-        image0, image1 = (x.cuda(non_blocking=True)[None, None].float() / 255. for x in images)
+        images = (x.cuda(non_blocking=True) for x in images)
+        layout = (lambda x: x.permute(2, 0, 1)[None]) if method.color else (lambda x: x[None, None])
+        image0, image1 = (layout(x).float() / 255. for x in images)
         if index == 0:
             for _ in range(opt.warmup):
                 match(image0, image1)
@@ -239,7 +324,7 @@ def run_matching(method, pairs, opt):
         end.record()
         end.synchronize()
         times.append(start.elapsed_time(end))
-        matches.append((kpts0.float().cpu().numpy() * scale, kpts1.float().cpu().numpy() * scale))
+        matches.append(tuple((k.float().cpu().numpy() + center) * scale - center for k in (kpts0, kpts1)))
     return matches, np.array(times)
 
 
@@ -309,8 +394,10 @@ def main():
     parser = argparse.ArgumentParser(description='ScanNet-1500 relative pose accuracy and speed of torch models and '
                                                  'TensorRT engines.')
     parser.add_argument('--engine', type=Path, nargs='*', default=None,
-                        help='Engines to evaluate, default: all in weights/eloftr and weights/loftr, and the legacy '
-                             'weights/LoFTR_teacher.engine.')
+                        help='Engines to evaluate, default: all in weights/eloftr, weights/loftr, weights/loma and '
+                             'weights/romav2, and the legacy weights/LoFTR_teacher.engine.')
+    parser.add_argument('--romav2-matches', type=int, default=5000,
+                        help='Matches sampled from the RoMa v2 warps (upstream ScanNet protocol: 5000).')
     parser.add_argument('--no-torch', action='store_true', help='Only evaluate the engines.')
     parser.add_argument('--paper', action='store_true',
                         help='Add the published ScanNet settings: EfficientLoFTR full in mixed precision with thr 0.1 '

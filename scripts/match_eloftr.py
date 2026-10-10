@@ -5,7 +5,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from eloftr.matcher import ELoFTRMatcher
+from eloftr.matcher import ELoFTRMatcher, engine_metadata
 from eloftr.upstream import DEFAULT_CKPT
 
 
@@ -24,20 +24,38 @@ def draw_matches(image0, image1, kpts0, kpts1, conf):
     return canvas
 
 
+def make_matcher(opt):
+    """The matcher of the engine's model (sidecar `model`), or of --model in torch."""
+    model = engine_metadata(opt.engine).get('model') if opt.engine is not None else opt.model
+    if model in ('loma', 'loma-b128', 'loma-b'):
+        from loma_trt.matcher import LoMaMatcher
+        variant = model.removeprefix('loma-') if model != 'loma' else None
+        return LoMaMatcher(opt.engine, variant, opt.height, opt.width, precision=opt.precision or 'fp32')
+    if model == 'romav2':
+        from romav2_trt.matcher import RoMaV2Matcher
+        return RoMaV2Matcher(opt.engine, opt.height, opt.width, opt.precision or 'fp32', num_matches=opt.num_matches)
+    return ELoFTRMatcher(opt.engine, opt.height, opt.width, opt.model_type, opt.precision or 'fp32', ckpt=opt.ckpt)
+
+
 def main():
-    parser = argparse.ArgumentParser(description='Match two images with EfficientLoFTR.')
+    parser = argparse.ArgumentParser(description='Match two images with EfficientLoFTR, LoFTR, LoMa or RoMa v2.')
     parser.add_argument('image0', type=Path)
     parser.add_argument('image1', type=Path)
-    parser.add_argument('--engine', type=Path, default=None, help='TensorRT engine; torch is used if omitted.')
+    parser.add_argument('--engine', type=Path, default=None,
+                        help='TensorRT engine (its sidecar names the model); torch is used if omitted.')
+    parser.add_argument('--model', choices=['eloftr', 'loma-b128', 'loma-b', 'romav2'], default='eloftr',
+                        help='Torch model without --engine.')
     parser.add_argument('--height', type=int, default=480, help='Torch input height (engines carry their own).')
     parser.add_argument('--width', type=int, default=640, help='Torch input width (engines carry their own).')
-    parser.add_argument('--model-type', choices=['full', 'opt'], default='full')
-    parser.add_argument('--precision', choices=['fp32', 'mixed'], default='fp32')
+    parser.add_argument('--model-type', choices=['full', 'opt'], default='full', help='EfficientLoFTR model type.')
+    parser.add_argument('--precision', default=None,
+                        help='Torch precision: fp32 (default), mixed (EfficientLoFTR), bf16 or fp16 (LoMa, RoMa v2).')
+    parser.add_argument('--num-matches', type=int, default=5000, help='Matches sampled from the RoMa v2 warp.')
     parser.add_argument('--ckpt', type=Path, default=DEFAULT_CKPT)
     parser.add_argument('--out', type=Path, default=Path('outputs/matches.jpg'))
     opt = parser.parse_args()
 
-    matcher = ELoFTRMatcher(opt.engine, opt.height, opt.width, opt.model_type, opt.precision, ckpt=opt.ckpt)
+    matcher = make_matcher(opt)
     image0, image1 = cv2.imread(str(opt.image0)), cv2.imread(str(opt.image1))
     if image0 is None or image1 is None:
         raise FileNotFoundError('Failed to read the input images')

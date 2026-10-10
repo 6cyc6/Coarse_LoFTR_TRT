@@ -53,7 +53,7 @@ class Trainer(object):
         self.teacher_cfg = default_cfg
         self.teacher_cfg['input_batch_size'] = real_batch_size
         self.teacher_model = LoFTR(config=self.teacher_cfg)
-        checkpoint = torch.load(weights_path)
+        checkpoint = torch.load(weights_path, weights_only=False)  # trusted Lightning checkpoints pickle objects
         if checkpoint is not None:
             missed_keys, unexpected_keys = self.teacher_model.load_state_dict(checkpoint['state_dict'], strict=False)
             if len(missed_keys) > 0:

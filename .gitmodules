@@ -1,3 +1,9 @@
 [submodule "third_party/EfficientLoFTR"]
 	path = third_party/EfficientLoFTR
 	url = https://github.com/zju3dv/EfficientLoFTR.git
+[submodule "third_party/LoMa"]
+	path = third_party/LoMa
+	url = https://github.com/davnords/LoMa.git
+[submodule "third_party/RoMaV2"]
+	path = third_party/RoMaV2
+	url = https://github.com/Parskatt/RoMaV2.git

@@ -5,7 +5,7 @@ import torch
 
 def load_checkpoint_for_inference(filename, model, ignore_missed=False):
     if os.path.exists(filename):
-        checkpoint = torch.load(filename)
+        checkpoint = torch.load(filename, weights_only=False)
         if checkpoint:
             miss_keys, _ = model.load_state_dict(checkpoint['model_state_dict'], strict=not ignore_missed)
             if miss_keys and not ignore_missed:
@@ -38,7 +38,7 @@ def load_last_checkpoint(path, model, optimizer, scaler):
 
 def load_checkpoint(filename, model, optimizer, scaler):
     if os.path.exists(filename):
-        checkpoint = torch.load(filename)
+        checkpoint = torch.load(filename, weights_only=False)
         if checkpoint:
             model.load_state_dict(checkpoint['model_state_dict'])
             if optimizer is not None and 'optimizer_state_dict' in checkpoint:

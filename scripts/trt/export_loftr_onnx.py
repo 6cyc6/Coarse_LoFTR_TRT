@@ -67,7 +67,7 @@ def main():
     inputs = tuple(to_tensor(load_gray(p, opt.height, opt.width)) for p in pairs[0])
     with torch.no_grad():
         torch.onnx.export(model, inputs, str(out), input_names=['image0', 'image1'], output_names=OUTPUT_NAMES,
-                          opset_version=opt.opset, do_constant_folding=True)
+                          opset_version=opt.opset, do_constant_folding=True, dynamo=False)
     onnx.checker.check_model(str(out))
 
     metadata = {'model': 'loftr', 'pretrained': opt.pretrained, 'height': opt.height, 'width': opt.width,

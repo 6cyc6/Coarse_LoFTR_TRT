@@ -30,7 +30,7 @@ def main():
 
     print('Loading pre-trained network...')
     model = LoFTR(config=model_cfg)
-    checkpoint = torch.load(opt.weights)
+    checkpoint = torch.load(opt.weights, weights_only=False)  # trusted Lightning checkpoints pickle objects
     if checkpoint is not None:
         if 'state_dict' in checkpoint:
             state_dict = checkpoint['state_dict']
@@ -73,7 +73,7 @@ def main():
 
     with torch.no_grad():
         dummy_image = torch.randn(1, 1, default_cfg['input_height'], default_cfg['input_width'], device=device)
-        torch.onnx.export(model, (dummy_image, dummy_image), opt.out_file, verbose=True, opset_version=11)
+        torch.onnx.export(model, (dummy_image, dummy_image), opt.out_file, verbose=True, opset_version=11, dynamo=False)
 
     model = onnx.load(opt.out_file)
     onnx.checker.check_model(model)

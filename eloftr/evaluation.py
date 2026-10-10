@@ -15,8 +15,18 @@ def load_gray(path, height, width):
     return cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA)
 
 
+def load_rgb(path, height, width):
+    image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if image is None:
+        raise FileNotFoundError(path)
+    return cv2.cvtColor(cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2RGB)
+
+
 def to_tensor(image, device='cuda'):
-    return torch.from_numpy(image)[None, None].to(device=device, dtype=torch.float32) / 255.
+    """uint8 [H, W] grayscale or [H, W, 3] color image -> [1, C, H, W] float tensor in [0, 1]."""
+    tensor = torch.from_numpy(image)
+    tensor = tensor[None, None] if tensor.ndim == 2 else tensor.permute(2, 0, 1)[None]
+    return tensor.to(device=device, dtype=torch.float32) / 255.
 
 
 def sample_pairs(directory=SAMPLE_IMAGES_DIR):

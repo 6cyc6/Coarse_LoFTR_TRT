@@ -1,7 +1,7 @@
 [workspace]
 name = "coarse-loftr-trt"
 version = "0.1.0"
-description = "Coarse LoFTR and EfficientLoFTR with TensorRT engines"
+description = "Coarse LoFTR, EfficientLoFTR, LoFTR, LoMa and RoMa v2 with TensorRT engines"
 channels = ["conda-forge"]
 platforms = [{ platform = "linux-64", cuda = "12" }]
 
@@ -12,13 +12,17 @@ py-opencv = "4.10.*"
 matplotlib = "*"
 tqdm = "*"
 yacs = "*"
+# LoMa and RoMa v2 read images with PIL
+pillow = "*"
 git = "*"
 # pytorch-lightning 1.9 still imports pkg_resources
 setuptools = "<75"
 
-# torch and TensorRT match the tracker's `trt` environment (torch 2.4.1 + TensorRT 10.9).
+# torch and TensorRT match the tracker's `trt` environment (torch 2.9.1 with CUDA 12.8 wheels + TensorRT 10.9).
+# RoMa v2 needs torch >= 2.5 and its DINOv3 backbone >= 2.7; LoMa needs torchvision >= 0.23.
 [pypi-dependencies]
-torch = "==2.4.1"
+torch = "==2.9.1"
+torchvision = "==0.24.1"
 tensorrt-cu12 = "==10.9.0.34"
 onnx = "==1.16.2"
 kornia = "==0.7.3"
@@ -102,6 +106,62 @@ args = [
 ]
 cmd = "python scripts/trt/build_trt_engine.py --onnx weights/loftr/loftr_{{ pretrained }}_{{ precision }}_{{ height }}x{{ width }}.onnx"
 depends-on = [{ task = "export-loftr-onnx", args = ["{{ height }}", "{{ width }}", "{{ pretrained }}", "{{ precision }}"] }]
+
+[tasks.export-loma-onnx]
+description = "Export a fixed-shape LoMa ONNX model (variant b128 or b)"
+args = [
+  { arg = "variant", default = "b128" },
+  { arg = "height", default = "384" },
+  { arg = "width", default = "384" },
+  { arg = "precision", default = "fp16" },
+]
+cmd = "python scripts/trt/export_loma_onnx.py --variant {{ variant }} --height {{ height }} --width {{ width }} --precision {{ precision }}"
+
+[tasks.build-loma-engine]
+description = "Export an ONNX model and build a TensorRT engine for LoMa"
+args = [
+  { arg = "variant", default = "b128" },
+  { arg = "height", default = "384" },
+  { arg = "width", default = "384" },
+  { arg = "precision", default = "fp16" },
+]
+cmd = "python scripts/trt/build_trt_engine.py --onnx weights/loma/loma_{{ variant }}_{{ precision }}_{{ height }}x{{ width }}.onnx"
+depends-on = [{ task = "export-loma-onnx", args = ["{{ variant }}", "{{ height }}", "{{ width }}", "{{ precision }}"] }]
+
+[tasks.build-loma-default]
+description = "Build the LoMa-B128 (384x384, 640x480) and LoMa-B (392x392, 672x504) fp16 engines"
+depends-on = [
+  { task = "build-loma-engine", args = ["b128", "384", "384", "fp16"] },
+  { task = "build-loma-engine", args = ["b128", "480", "640", "fp16"] },
+  { task = "build-loma-engine", args = ["b", "392", "392", "fp16"] },
+  { task = "build-loma-engine", args = ["b", "504", "672", "fp16"] },
+]
+
+[tasks.export-romav2-onnx]
+description = "Export a fixed-shape RoMa v2 ONNX model"
+args = [
+  { arg = "height", default = "384" },
+  { arg = "width", default = "384" },
+  { arg = "precision", default = "fp16" },
+]
+cmd = "python scripts/trt/export_romav2_onnx.py --height {{ height }} --width {{ width }} --precision {{ precision }}"
+
+[tasks.build-romav2-engine]
+description = "Export an ONNX model and build a TensorRT engine for RoMa v2"
+args = [
+  { arg = "height", default = "384" },
+  { arg = "width", default = "384" },
+  { arg = "precision", default = "fp16" },
+]
+cmd = "python scripts/trt/build_trt_engine.py --onnx weights/romav2/romav2_{{ precision }}_{{ height }}x{{ width }}.onnx"
+depends-on = [{ task = "export-romav2-onnx", args = ["{{ height }}", "{{ width }}", "{{ precision }}"] }]
+
+[tasks.build-romav2-default]
+description = "Build the RoMa v2 384x384 and 640x480 fp16 engines (DINOv3 in bf16)"
+depends-on = [
+  { task = "build-romav2-engine", args = ["384", "384", "fp16"] },
+  { task = "build-romav2-engine", args = ["480", "640", "fp16"] },
+]
 
 [tasks.build-legacy]
 description = "Build the legacy Coarse LoFTR engine with the pixi TensorRT"

@@ -8,19 +8,22 @@ The code is based on the original [LoFTR](https://github.com/zju3dv/LoFTR) repos
 
 ### Environment
 
-The repository uses [pixi](https://pixi.sh) (Python 3.11, PyTorch 2.4.1, TensorRT 10.9 from PyPI, CUDA 12 driver):
+The repository uses [pixi](https://pixi.sh) (Python 3.11, PyTorch 2.9.1 and torchvision 0.24.1 with CUDA 12.8, TensorRT 10.9 from PyPI, CUDA 12 driver):
 ```
 pixi install
-pixi run init-submodules   # fetches third_party/EfficientLoFTR
+pixi run init-submodules   # fetches third_party/EfficientLoFTR, third_party/LoMa and third_party/RoMaV2
 ```
+
+torch and TensorRT match the `trt` environment of the tracker that consumes the engines; engines only load with the TensorRT version that built them. torch 2.9 exports ONNX with the dynamo exporter by default, so the export scripts pass `dynamo=False` (the TorchScript exporter the models were validated with), and since torch 2.6 loads checkpoints with `weights_only=True`, so trusted local checkpoints that pickle Python objects (Lightning checkpoints) are loaded with `weights_only=False`.
 
 Datasets are stored under `DATASET_DIR`, set in `run/env.sh` (default `~/dataset`; a value already exported in the shell takes precedence). `pixi run download-scannet` downloads the ScanNet-1500 test set (1500 indoor pairs from 100 scenes, 1.1 GB) from the LoFTR Google Drive folder to `$DATASET_DIR/scannet`.
 
 ### Repository layout
 
 * `eloftr/`, `loftr_full/`: fixed-shape EfficientLoFTR and LoFTR for ONNX/TensorRT, the TensorRT runtime (`eloftr/trt_runtime.py`) and evaluation helpers (`eloftr/evaluation.py`, `eloftr/pose.py`).
+* `loma_trt/`, `romav2_trt/`: fixed-shape LoMa and RoMa v2 (`upstream.py` loader, `static_model.py`, `evaluation.py` comparisons and engine smoke tests, `matcher.py`).
 * `loftr/`, `train/`: the legacy Coarse LoFTR model and its distillation training; shared helpers are in `loftr/utils/helpers.py`.
-* `scripts/trt/`: ONNX export and TensorRT engine building (`export_eloftr_onnx.py`, `export_loftr_onnx.py`, legacy `export_onnx.py`, `build_trt_engine.py`).
+* `scripts/trt/`: ONNX export and TensorRT engine building (`export_eloftr_onnx.py`, `export_loftr_onnx.py`, `export_loma_onnx.py`, `export_romav2_onnx.py`, legacy `export_onnx.py`, `build_trt_engine.py`).
 * `scripts/eval/`: benchmarks (`eval_eloftr.py` on the sample images, `eval_scannet.py` on ScanNet-1500).
 * `scripts/`: demos and training entry points (`match_eloftr.py`, `webcam.py`, `train_distill.py`, `compare.py`).
 * `run/`: shell scripts (`env.sh`, `download_scannet.sh`, `export_trt.sh`, `start_tensorboard.sh`).
@@ -88,9 +91,47 @@ Results on an RTX 4070 Ti SUPER at 640x480, with the metrics of `scripts/eval/ev
 
 The static model refines all 4800 coarse cells at the fine level, where kornia refines only the ~400 matches, which is why the fp32 engine is not faster than kornia.
 
+### LoMa + TensorRT
+
+[LoMa](https://github.com/davnords/LoMa) is included as an unmodified, pinned git submodule in `third_party/LoMa` (MIT; its matcher keeps LightGlue's Apache-2.0 license). Two variants are supported: LoMa-B128 (`LoMaB128`: DaD detector, DeDoDe-B descriptor with 128-d descriptions, 9-layer LightGlue-style matcher) and LoMa-B (`LoMaB`: the same with the DeDoDe-G descriptor, which adds DINOv2 ViT-L/14). Upstream downloads its weights to the torch hub cache on first use (LoMa-B128 150 MB; LoMa-B 760 MB, plus 1.2 GB of DINOv2 weights its constructor fetches and then overwrites).
+
+`loma_trt.StaticLoMa` is upstream's tensor API at a fixed size: DaD detects 2048 keypoints per image (dense scoremap, 3x3 NMS, top-k, sub-pixel refinement), DeDoDe describes them at the same size, and the transformer matches them. Every keypoint of the first image keeps its best match, and a `valid` mask marks the mutual nearest neighbours above upstream's threshold 0.1, so the engines have the output contract of the EfficientLoFTR engines with `L = 2048`: `keypoints0`, `keypoints1` (`[L, 2]`), `confidence` and `valid` (`[L]`). Inputs are RGB, `[1, 3, H, W]` in [0, 1], and keypoints are OpenCV pixels of the engine input (pixel centres at integers; upstream's `to_pixel_coords` minus 0.5). `loma_trt.matcher.LoMaMatcher` resizes images, filters the matches and maps them back.
+
+```
+pixi run build-loma-default   # LoMa-B128 384x384 and 640x480, LoMa-B 392x392 and 672x504, fp16, in weights/loma
+pixi run match <image0> <image1> --engine weights/loma/loma_b_fp16_392x392.engine
+```
+
+Other engines: `pixi run build-loma-engine <b128|b> <height> <width> <fp16|bf16|fp32>`, sizes multiples of 8 (of 56 for LoMa-B, whose DINOv2 has 14-pixel patches); `scripts/trt/export_loma_onnx.py --num-keypoints` changes the keypoint count (up to 3840, the TensorRT top-k limit).
+
+* Precision: upstream runs the CNNs, DINOv2 and the transformer under bf16 autocast (fp16 before Ampere). The engines default to fp16 in the same places: all activations stay far below the fp16 range (DINOv2 peaks at about 400), TensorRT runs it faster, and it agrees better with fp32. Which 2048 keypoints survive the top-k, and where the sub-pixel refinement puts them, depends on the precision: on the sample images at 384x384, upstream's own bf16 keeps 80% of the fp32 keypoints and a Jaccard index of 0.70 between the match sets; the fp16 engine keeps 96% and 0.94, the bf16 engine 84% and 0.78. The scoremap logits, softmaxes, NMS, top-k, sampling and matching run in fp32 in every mode. TensorRT 10.9 has no bf16 Resize, so interpolations run in fp32 and round once, as PyTorch's half-precision kernels do.
+* `scripts/trt/export_loma_onnx.py` checks that `StaticLoMa` in fp32 reproduces upstream in fp32 (autocast off, DINOv2 cast back) before exporting: keypoints are aligned by mutual nearest neighbour, then matches are compared like the EfficientLoFTR ones (Jaccard 0.993 to 1.0, zero median displacement error). The engine smoke test compares an engine with `StaticLoMa` in fp32 and accepts it if it agrees about as well as `StaticLoMa` in torch at the engine's precision does.
+* Two exporter pitfalls are avoided in `StaticLoMa`: upstream's `unflatten(-1, ...)` exports as a wrong reshape, and TorchScript pools equal constants, after which the export rewrites a stack's `-1` dim in place and corrupts other ops sharing it. The model therefore uses explicit reshapes, positive dims and Python-int shapes.
+
+On an RTX 3090 the fp16 engines take 17 ms (LoMa-B128, 384x384), 32 ms (LoMa-B128, 640x480), 41 ms (LoMa-B, 392x392) and 84 ms (LoMa-B, 672x504) per pair, 2.6-3.7x faster than upstream in its mixed precision, with the same ScanNet-1500 accuracy (within 0.25 AUC points, see [ScanNet benchmark](#scannet-benchmark)).
+
+### RoMa v2 + TensorRT
+
+[RoMa v2](https://github.com/Parskatt/RoMaV2) is included as an unmodified, pinned git submodule in `third_party/RoMaV2` (MIT; its DINOv3 backbone has the [DINOv3 license](https://github.com/facebookresearch/dinov3/blob/main/LICENSE.md)). Upstream fetches the DINOv3 code with torch.hub at a pinned commit and downloads its weights (1.1 GB, DINOv3 included) to the torch hub cache on first use.
+
+`romav2_trt.StaticRoMaV2` is upstream's single-resolution forward, `RoMaV2.forward(img_A, img_B)`, at a fixed size: DINOv3 ViT-L/16 features (layers 11 and 17; the blocks after 17 are dropped), the multi-view transformer, global softmax matching, the DPT head, and the refiners at 1/4, 1/2 and full resolution. The engines output upstream's dense predictions, `warp_AB` (`[1, H, W, 2]`, normalized coordinates in image1 of every pixel of image0) and `confidence_AB` (`[1, H, W, 4]`, overlap logit and the parameters of a 2x2 precision matrix); `--bidirectional` adds `warp_BA` and `confidence_BA`. Matches are sampled from them outside the engine by upstream's `RoMaV2.sample` (multinomial on the overlap, balanced by a kernel density estimate), seeded, in `romav2_trt.matcher.RoMaV2Matcher`, which returns OpenCV pixels like the other matchers. Upstream's second, high-resolution refinement pass (its `precise` setting) is not part of the engines.
+
+```
+pixi run build-romav2-default   # 384x384 and 640x480, fp16 (DINOv3 in bf16), in weights/romav2
+pixi run match <image0> <image1> --engine weights/romav2/romav2_fp16_384x384.engine --num-matches 2000
+```
+
+Other engines: `pixi run build-romav2-engine <height> <width> <fp16|bf16|fp32>`, sizes multiples of 16 (`pixi run build-romav2-engine 320 320` is upstream's `turbo` setting); `scripts/trt/export_romav2_onnx.py --bidirectional` exports both directions.
+
+* Precision: upstream runs DINOv3 (cast to bf16), the matcher, the DPT head and the refiner convolutions in bf16. DINOv3's residual stream holds activations of about 1.6e5, beyond the fp16 range, so `fp16` engines keep DINOv3 in bf16 and run the rest in fp16; `bf16` engines follow upstream. On the sample images at 384x384, the fp16 engine's warp differs from fp32 by a median of 0.013 px (2.2% of the overlapping pixels by more than 1 px), the bf16 engine's by 0.032 px (3.2%), and the fp16 engine is 13% faster. Global matching, the refiner projections, grid sampling, local correlation, the heads and all warp and confidence arithmetic run in fp32, as in upstream. TensorRT 10.9 has no bf16 Resize or ConvTranspose, so those run in fp32 in bf16 engines. At 320x320 the precision matters more: with DINOv3 in bf16 alone, the warp of a hard pair can jump by pixels in whole regions, and on the sample images upstream's own bf16 and the fp16 engine both move 9% of the overlapping pixels by more than 1 px against fp32; the engine smoke test therefore compares that share relative to the noise of the torch model at the same precision.
+* Upstream's matcher applies RoPE in bf16 even in an fp32 run, which turns rounding-level differences (e.g. running DINOv3 on both images as one batch, which the engines do) into differences of about 1e-3. The export self-check therefore runs DINOv3 per image, as upstream does, and then reproduces upstream fp32 exactly (median warp difference 3e-6 px, identical overlap masks).
+* Local correlation is computed as upstream's native implementation (grid sampling of the 7x7 and 3x3 windows); the optional fused CUDA kernel of upstream (`fused-local-corr`, which pins another torch version) is not installed, so upstream also uses the native path in the comparisons. At 384x384 the 7x7 correlation takes about a fifth of the engine's time.
+
+On an RTX 3090 the fp16 engines take 24 ms (320x320), 34 ms (384x384) and 74 ms (640x480) per pair, against 49 ms and 63 ms for upstream's forward at 320x320 and 384x384 (timings on this GPU, which also drives a desktop, vary by up to 20% with its clock and temperature). Sampling 5000 matches with upstream's sampler adds 15.5 ms (its kernel density estimate compares 20000 candidates), 1000 matches 1.1 ms. ScanNet-1500 accuracy is that of upstream (within 0.3 AUC points, see [ScanNet benchmark](#scannet-benchmark)).
+
 ### ScanNet benchmark
 
-`scripts/eval/eval_scannet.py` measures relative pose accuracy and speed on ScanNet-1500 (`pixi run download-scannet` first) with the protocol of the upstream EfficientLoFTR test: images resized to 640x480, essential matrix by OpenCV RANSAC (0.5 px, confidence 0.99999) on 5 shuffles of the matches, AUC of the pose error max(rotation, translation angle) at 5/10/20 degrees, and precision as the fraction of matches with a symmetric epipolar distance below 5e-4. The metrics (`eloftr/pose.py`) reproduce upstream `src/utils/metrics.py`. It evaluates every engine in `weights/eloftr`, `weights/loftr` and the legacy `weights/LoFTR_teacher.engine`, each next to the torch model it was exported from at the same input size and matching settings, and checks that every engine stays within 1 AUC point and 3% of the match count of its torch model.
+`scripts/eval/eval_scannet.py` measures relative pose accuracy and speed on ScanNet-1500 (`pixi run download-scannet` first) with the protocol of the upstream EfficientLoFTR test: images resized to 640x480, essential matrix by OpenCV RANSAC (0.5 px, confidence 0.99999) on 5 shuffles of the matches, AUC of the pose error max(rotation, translation angle) at 5/10/20 degrees, and precision as the fraction of matches with a symmetric epipolar distance below 5e-4. The metrics (`eloftr/pose.py`) reproduce upstream `src/utils/metrics.py`. It evaluates every engine in `weights/eloftr`, `weights/loftr`, `weights/loma`, `weights/romav2` and the legacy `weights/LoFTR_teacher.engine`, each next to the torch model it was exported from at the same input size and matching settings, and checks that every engine stays within 1 AUC point and 3% of the match count of its torch model.
 
 ```
 pixi run eval-scannet                 # all engines and their torch models, report in outputs/eval/scannet.json
@@ -137,6 +178,30 @@ EfficientLoFTR `full` and `opt` at both engine sizes (`pixi run eval-scannet --e
 
 The engines stay within 0.8 AUC points and 0.2% of the match count of their torch models; the torch rows themselves vary by up to 0.7 points between runs. `opt` returns about 10% more matches than `full` at a lower precision and loses 2.2-3.4 AUC@20 points across these rows, so `full` remains the recommended model type.
 * LoFTR with the ScanNet weights finds no matches on 73 of the 1500 pairs; they count as failed poses, as upstream does.
+
+LoMa and RoMa v2 at their engine sizes (`pixi run eval-scannet --engine weights/loma/*.engine weights/romav2/*.engine`, a separate run on an RTX 3090, about 45 minutes). Each engine is compared with upstream in its default mixed precision (`mp`, bf16 autocast) on the same RGB images, resized from the original images to the engine size; the matches are mapped back to 640x480. RoMa v2 samples 5000 matches with upstream's sampler from a fixed seed, and its latency includes the sampling:
+
+| Model | Size | Matches | AUC@5 | AUC@10 | AUC@20 | P@5e-4 | Latency |
+|---|---|---|---|---|---|---|---|
+| LoMa-B128 torch `mp` | 384x384 | 567 | 24.55 | 46.23 | 64.88 | 86.21 | 70.8 ms |
+| LoMa-B128 TensorRT fp16 | 384x384 | 572 | 24.59 | 46.00 | 64.92 | 86.15 | 19.1 ms |
+| LoMa-B128 torch `mp` | 640x480 | 567 | 25.32 | 46.88 | 65.55 | 85.82 | 104.2 ms |
+| LoMa-B128 TensorRT fp16 | 640x480 | 573 | 25.42 | 46.84 | 65.37 | 85.82 | 32.2 ms |
+| LoMa-B torch `mp` | 392x392 | 590 | 26.99 | 48.92 | 67.66 | 87.49 | 137.5 ms |
+| LoMa-B TensorRT fp16 | 392x392 | 594 | 27.07 | 48.79 | 67.48 | 87.43 | 40.8 ms |
+| LoMa-B torch `mp` | 672x504 | 574 | 27.69 | 49.97 | 68.58 | 87.54 | 224.9 ms |
+| LoMa-B TensorRT fp16 | 672x504 | 580 | 27.74 | 49.86 | 68.47 | 87.55 | 85.8 ms |
+| RoMa v2 torch `mp` | 320x320 | 5000 | 29.29 | 51.82 | 70.38 | 87.97 | 69.5 ms |
+| RoMa v2 TensorRT fp16 | 320x320 | 5000 | 29.46 | 51.88 | 70.49 | 88.01 | 40.1 ms |
+| RoMa v2 torch `mp` | 320x320 | 1000 | 29.20 | 51.56 | 70.08 | 89.17 | 52.0 ms |
+| RoMa v2 TensorRT fp16 | 320x320 | 1000 | 29.02 | 51.49 | 70.15 | 89.21 | 24.8 ms |
+| RoMa v2 torch `mp` | 384x384 | 5000 | 31.49 | 54.40 | 72.38 | 89.12 | 96.7 ms |
+| RoMa v2 TensorRT fp16 | 384x384 | 5000 | 31.78 | 54.48 | 72.45 | 89.13 | 54.8 ms |
+| RoMa v2 torch `mp` | 640x480 | 5000 | 32.79 | 55.53 | 73.25 | 89.68 | 167.3 ms |
+| RoMa v2 TensorRT fp16 | 640x480 | 5000 | 32.71 | 55.30 | 73.03 | 89.67 | 100.1 ms |
+
+* The engines stay within 0.3 AUC points and 1.1% of the match count of upstream. The 320x320 rows (upstream's `turbo` size) are from separate runs (`--engine weights/romav2/romav2_fp16_320x320.engine`, and `--romav2-matches 1000` for the 1000-match rows); 320x320 gives up 2.0-2.6 AUC points against 384x384 for 27% lower latency (29% for the engine alone), and sampling 1000 instead of 5000 matches costs at most another 0.45 points (about the run-to-run spread) for 38% lower latency.
+* These are not the published settings: LoMa's own benchmark detects at 1024 pixels on the long side and describes at 784x784, and RoMa v2's runs at 800x800 with a 1024x1024 refinement pass in both directions.
 
 ### Model weights
 Weights for the PyTorch model, ONNX model and TensorRT engine files are located in the `weights` folder.

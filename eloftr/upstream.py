@@ -56,7 +56,8 @@ def load_upstream(ckpt=DEFAULT_CKPT, model_type='full', npe=None, mp=False, devi
         raise FileNotFoundError(f'{ckpt} not found, run: pixi run download-weights')
     loftr = import_upstream()
     model = loftr.LoFTR(config=make_config(model_type, npe, mp, thr, border_rm))
-    model.load_state_dict(torch.load(ckpt, map_location='cpu')['state_dict'])
+    # the checkpoint also pickles a Lightning ModelCheckpoint, so it needs the full (trusted) unpickler
+    model.load_state_dict(torch.load(ckpt, map_location='cpu', weights_only=False)['state_dict'])
     model = loftr.reparameter(model)
     return model.eval().to(device)
 

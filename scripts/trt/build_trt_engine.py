@@ -1,4 +1,5 @@
 import argparse
+import importlib
 import json
 import time
 from pathlib import Path
@@ -8,6 +9,9 @@ import torch
 
 from eloftr import sidecar_path
 from eloftr.trt_runtime import TRTEngine, build_engine
+
+# Models with their own output contract and smoke test (engine vs the torch static model at the same precision)
+SMOKE_TESTS = {'loma': 'loma_trt.evaluation', 'romav2': 'romav2_trt.evaluation'}
 
 
 def reference_model(meta):
@@ -51,7 +55,7 @@ def main():
     parser.add_argument('--engine', type=Path, default=None, help='Output engine, default: ONNX path with .engine.')
     parser.add_argument('--fp16', action='store_true',
                         help='Weakly-typed FP16 builder flag for untyped legacy ONNX models (TensorRT 10 only). '
-                             'EfficientLoFTR and LoFTR exports carry their precision in the ONNX types instead.')
+                             'The exports of this repository carry their precision in the ONNX types instead.')
     parser.add_argument('--tf32', action='store_true', help='Allow TF32 for fp32 layers (lower accuracy).')
     parser.add_argument('--workspace-gib', type=float, default=4.0)
     parser.add_argument('--opt-level', type=int, default=3, help='Builder optimization level 0-5.')
@@ -76,8 +80,11 @@ def main():
                  'gpu': torch.cuda.get_device_name(), 'build_seconds': round(time.perf_counter() - started, 1)})
     print(f'Built {engine_path} in {meta["build_seconds"]} s')
 
-    if 'fp16_groups' in meta and not opt.skip_check:  # sidecar of an exported EfficientLoFTR or LoFTR model
-        meta['smoke_test'] = smoke_test(engine_path, meta)
+    if not opt.skip_check:
+        if meta.get('model') in SMOKE_TESTS:
+            meta['smoke_test'] = importlib.import_module(SMOKE_TESTS[meta['model']]).smoke_test(engine_path, meta)
+        elif 'fp16_groups' in meta:  # sidecar of an exported EfficientLoFTR or LoFTR model
+            meta['smoke_test'] = smoke_test(engine_path, meta)
     sidecar_path(engine_path).write_text(json.dumps(meta, indent=2))
 
 

@@ -53,7 +53,7 @@ def main():
         import torch.nn.functional
 
         matcher = LoFTR(config=model_cfg)
-        checkpoint = torch.load(opt.weights)
+        checkpoint = torch.load(opt.weights, weights_only=False)  # trusted Lightning checkpoints pickle objects
         if checkpoint is not None:
             if 'state_dict' in checkpoint:
                 state_dict = checkpoint['state_dict']

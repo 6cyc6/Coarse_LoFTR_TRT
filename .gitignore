@@ -134,9 +134,11 @@ dmypy.json
 # pixi environments
 .pixi/
 
-# Generated EfficientLoFTR/LoFTR weights, ONNX models and engines, and legacy rebuilt engines
+# Generated EfficientLoFTR/LoFTR/LoMa/RoMa v2 weights, ONNX models and engines, and legacy rebuilt engines
 weights/eloftr/
 weights/loftr/
+weights/loma/
+weights/romav2/
 weights/*.engine
 weights/*.engine.json
 weights/trt_timing.cache
