@@ -5,7 +5,7 @@ import cv2
 import numpy as np
 import torch
 
-from eloftr import sidecar_path
+from eloftr import plugin_paths, sidecar_path
 from eloftr.static_model import StaticELoFTR, precision_groups
 from eloftr.upstream import DEFAULT_CKPT, load_upstream
 
@@ -24,7 +24,7 @@ class ELoFTRMatcher:
             meta = engine_metadata(engine)
             # LoFTR engines (loftr_full) share the output contract and have no model_type
             self.height, self.width, self.model_type = meta['height'], meta['width'], meta.get('model_type')
-            self.engine = TRTEngine(engine, device)
+            self.engine = TRTEngine(engine, device, plugins=plugin_paths(meta))
             if cuda_graph:
                 self.engine.capture_cuda_graph()
             self.model = None

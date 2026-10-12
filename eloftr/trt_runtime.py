@@ -22,8 +22,23 @@ def _logger(verbose=False):
     return trt.Logger(trt.Logger.VERBOSE if verbose else trt.Logger.WARNING)
 
 
+_LOADED_PLUGINS = {}
+
+
+def load_plugins(paths, logger=None):
+    """Register the plugin libraries `paths` (e.g. SLiM's selective scan) with TensorRT, once per process."""
+    trt.init_libnvinfer_plugins(logger or _logger(), '')
+    registry = trt.get_plugin_registry()
+    for path in paths:
+        path = str(Path(path).resolve())
+        if path not in _LOADED_PLUGINS:
+            if not Path(path).exists():
+                raise FileNotFoundError(f'Plugin library {path} not found')
+            _LOADED_PLUGINS[path] = registry.load_library(path)
+
+
 def build_engine(onnx_path, engine_path, strongly_typed=True, fp16=False, tf32=False, workspace_gib=4.0,
-                 opt_level=3, timing_cache=None, verbose=False):
+                 opt_level=3, timing_cache=None, verbose=False, plugins=()):
     """Build and save a TensorRT engine from an ONNX file.
 
     Args:
@@ -31,8 +46,10 @@ def build_engine(onnx_path, engine_path, strongly_typed=True, fp16=False, tf32=F
             EfficientLoFTR; the only mode in TensorRT 11)
         fp16: weakly-typed FP16 builder flag for untyped legacy ONNX models (TensorRT 10 only)
         tf32: allow TF32 for fp32 math; off by default because it lowers fp32 layers to ~fp16 mantissa
+        plugins: plugin libraries implementing custom ONNX ops
     """
     logger = _logger(verbose)
+    load_plugins(plugins, logger)
     builder = trt.Builder(logger)
     flags = 0
     if strongly_typed and TRT_MAJOR < 11:
@@ -77,11 +94,11 @@ class TRTEngine:
     Outputs returned by __call__ are the engine's buffers and are overwritten by the next call.
     """
 
-    def __init__(self, engine_path, device='cuda'):
+    def __init__(self, engine_path, device='cuda', plugins=()):
         self.device = torch.device(device)
         torch.cuda.init()
         logger = _logger()
-        trt.init_libnvinfer_plugins(logger, '')
+        load_plugins(plugins, logger)
         self.runtime = trt.Runtime(logger)
         with torch.cuda.device(self.device):
             self.engine = self.runtime.deserialize_cuda_engine(Path(engine_path).read_bytes())

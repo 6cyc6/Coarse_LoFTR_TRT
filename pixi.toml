@@ -39,8 +39,48 @@ tensorboard = "*"
 [activation.env]
 PYTHONPATH = "$PIXI_PROJECT_ROOT"
 
+# SLiM (third_party/SLiM): its torch model needs mamba-ssm, causal-conv1d and VMamba's selective scan kernel,
+# which is compiled with the system CUDA toolkit (pixi run build-slim-kernels); the default environment stays free of them.
+[feature.slim.dependencies]
+pip = "*"
+wheel = "*"
+
+[feature.slim.pypi-dependencies]
+mamba-ssm = { url = "https://github.com/state-spaces/mamba/releases/download/v2.2.2/mamba_ssm-2.2.2+cu122torch2.4cxx11abiFALSE-cp311-cp311-linux_x86_64.whl" }
+causal-conv1d = { url = "https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.4.0/causal_conv1d-1.4.0+cu122torch2.4cxx11abiFALSE-cp311-cp311-linux_x86_64.whl" }
+transformers = "==4.42.4"  # mamba-ssm dependency, the version SLiM uses
+timm = "*"
+fvcore = "*"
+
+[feature.slim.activation.env]
+CUDA_HOME = "/usr/local/cuda-12.4"
+
+[feature.slim.tasks]
+build-slim-kernels = { cmd = "bash run/build_slim_kernels.sh", description = "Compile VMamba's selective scan kernel that SLiM's torch model uses (once per environment)" }
+
+[feature.slim.tasks.build-slim-plugin]
+description = "Compile the TensorRT selective scan plugin to build/slim_plugin"
+cmd = "bash run/build_slim_plugin.sh"
+inputs = ["run/build_slim_plugin.sh", "slim/plugin/**"]
+outputs = ["build/slim_plugin/libslim_trt_plugins.so"]
+
+[feature.slim.tasks.export-slim-onnx]
+description = "Export a fixed-shape SLiM ONNX model (640x480, indoor test settings)"
+args = [{ arg = "precision", default = "mixed" }]
+cmd = "python scripts/trt/export_slim_onnx.py --precision {{ precision }}"
+
+[feature.slim.tasks.build-slim-engine]
+description = "Export a SLiM ONNX model and build its TensorRT engine with the selective scan plugin"
+args = [{ arg = "precision", default = "mixed" }]
+cmd = "python scripts/trt/build_trt_engine.py --onnx weights/slim/slim_indoor_{{ precision }}_480x640.onnx"
+depends-on = [{ task = "build-slim-plugin" }, { task = "export-slim-onnx", args = ["{{ precision }}"] }]
+
+[environments]
+default = { solve-group = "default" }
+slim = { features = ["slim"], solve-group = "default" }
+
 [tasks]
-init-submodules = { cmd = "git submodule update --init --recursive", description = "Fetch the pinned EfficientLoFTR source" }
+init-submodules = { cmd = "git submodule update --init --recursive", description = "Fetch the pinned EfficientLoFTR, LoMa, RoMa v2 and SLiM sources" }
 download-weights = { cmd = "python -m eloftr.download", description = "Download eloftr_outdoor.ckpt to weights/eloftr" }
 download-scannet = { cmd = "bash run/download_scannet.sh", description = "Download the ScanNet-1500 test set to $DATASET_DIR (set in run/env.sh)" }
 

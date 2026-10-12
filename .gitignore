@@ -139,6 +139,7 @@ weights/eloftr/
 weights/loftr/
 weights/loma/
 weights/romav2/
+weights/slim/
 weights/*.engine
 weights/*.engine.json
 weights/trt_timing.cache

@@ -14,6 +14,7 @@ settings for EfficientLoFTR (thr 0.1, no border removal, mixed precision) and th
 precision on the same RGB inputs; RoMa v2 matches are sampled with upstream's sampler from a fixed seed.
 """
 import argparse
+import importlib.util
 import json
 import os
 import sys
@@ -26,6 +27,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+from eloftr import plugin_paths
 from eloftr.matcher import engine_metadata
 from eloftr.pose import pose_auc, pose_error, symmetric_epipolar_distance
 from eloftr.trt_runtime import TRTEngine
@@ -36,10 +38,11 @@ ASSETS = UPSTREAM_DIR / 'assets' / 'scannet_test_1500'
 LOFTR_WEIGHTS = ROOT / 'weights' / 'loftr'
 LOMA_WEIGHTS = ROOT / 'weights' / 'loma'
 ROMAV2_WEIGHTS = ROOT / 'weights' / 'romav2'
+SLIM_WEIGHTS = ROOT / 'weights' / 'slim'
 LEGACY_ENGINE = ROOT / 'weights' / 'LoFTR_teacher.engine'
 LEGACY_WEIGHTS = ROOT / 'weights' / 'LoFTR_teacher.pt'
 HEIGHT, WIDTH = 480, 640  # resolution of the ScanNet intrinsics; keypoints are mapped back to it
-RANSAC_THR, RANSAC_CONF, EPI_THR = 0.5, 0.99999, 5e-4
+RANSAC_CONF, EPI_THR = 0.99999, 5e-4
 LEGACY_CONF_THR = 0.01  # loftr.utils.helpers.get_coarse_match
 # Acceptance targets for TensorRT engines against their torch model, in AUC percentage points and match count ratio.
 # Only checked on the full 1500 pairs.
@@ -128,15 +131,35 @@ def loftr_torch(pretrained, height, width):
     return Method(f'loftr {pretrained} torch fp32{size_suffix(height, width)}', height, width, load)
 
 
+def slim_available():
+    """The SLiM torch model needs the slim environment (mamba-ssm and the compiled selective scan kernel)."""
+    return all(importlib.util.find_spec(m) for m in ('mamba_ssm', 'selective_scan_cuda_oflex'))
+
+
+def slim_torch(amp, variant='indoor', config='indoor_test', ckpt=None):
+    """Upstream SLiM (its CUDA and Triton kernels), as its test.py runs it: fp32, or autocast with --amp."""
+    def load():
+        from slim.upstream import DEFAULT_CKPT as SLIM_CKPT, load_upstream as load_slim, run_upstream as run_slim
+        model = load_slim(ckpt or SLIM_CKPT, config)
+        model.initial_forward()  # upstream warm-up before testing
+
+        def match(image0, image1):
+            data = run_slim(model, image0, image1, amp=amp)
+            kpts0 = data['fine_coord_0']
+            return kpts0, data['fine_coord_1'], torch.ones(len(kpts0), device=kpts0.device)
+        return match
+    return Method(f'slim {variant} torch {"amp" if amp else "fp32"}', HEIGHT, WIDTH, load)
+
+
 def static_engine(path, cuda_graph):
-    """EfficientLoFTR or LoFTR engine: one candidate per coarse cell of image0 and a `valid` mask."""
+    """EfficientLoFTR, LoFTR or SLiM engine: fixed-size candidate matches and a `valid` mask."""
     meta = engine_metadata(path)
     height, width = meta['height'], meta['width']
-    variant = meta['model_type'] if meta['model'] == 'eloftr' else meta['pretrained']
+    variant = {'eloftr': meta.get('model_type'), 'loftr': meta.get('pretrained'), 'slim': meta.get('variant')}[meta['model']]
     name = f'{meta["model"]} {variant} trt {meta["precision"]}{size_suffix(height, width)}'
 
     def load():
-        engine = TRTEngine(path)
+        engine = TRTEngine(path, plugins=plugin_paths(meta))
         if cuda_graph:
             engine.capture_cuda_graph()
 
@@ -148,6 +171,8 @@ def static_engine(path, cuda_graph):
 
     if meta['model'] == 'eloftr':
         reference = eloftr_torch(meta['model_type'], False, height, width, npe=meta.get('npe'))
+    elif meta['model'] == 'slim':
+        reference = slim_torch(False, variant, meta['config'], meta['checkpoint'])
     else:
         reference = loftr_torch(meta['pretrained'], height, width)
     return Method(name, height, width, load, reference.name), reference
@@ -273,15 +298,15 @@ def legacy_engine(path, cuda_graph):
 
 
 def make_methods(opt):
-    """TensorRT engines, each preceded by its torch model (EfficientLoFTR also in upstream mixed precision)."""
+    """TensorRT engines, each preceded by its torch model (EfficientLoFTR and SLiM also in mixed precision)."""
     engines = opt.engine if opt.engine is not None else (
         sorted(ELOFTR_WEIGHTS.glob('*.engine')) + sorted(LOFTR_WEIGHTS.glob('*.engine'))
         + sorted(LOMA_WEIGHTS.glob('*.engine')) + sorted(ROMAV2_WEIGHTS.glob('*.engine'))
-        + ([LEGACY_ENGINE] if LEGACY_ENGINE.exists() else []))
+        + sorted(SLIM_WEIGHTS.glob('*.engine')) + ([LEGACY_ENGINE] if LEGACY_ENGINE.exists() else []))
     methods = {}
     for path in engines:
         meta = engine_metadata(path)
-        if meta.get('model') in ('eloftr', 'loftr'):
+        if meta.get('model') in ('eloftr', 'loftr', 'slim'):
             method, reference = static_engine(path, opt.cuda_graph)
         elif meta.get('model') == 'loma':
             method, reference = loma_engine(path, opt.cuda_graph)
@@ -289,11 +314,20 @@ def make_methods(opt):
             method, reference = romav2_engine(path, opt.cuda_graph, opt.romav2_matches)
         else:
             method, reference = legacy_engine(path, opt.cuda_graph)
+        torch_methods = []
         if not opt.no_torch:
-            methods.setdefault(reference.name, reference)
+            torch_methods = [reference]
             if meta.get('model') == 'eloftr':
-                mp = eloftr_torch(meta['model_type'], True, method.height, method.width, npe=meta.get('npe'))
-                methods.setdefault(mp.name, mp)
+                torch_methods.append(eloftr_torch(meta['model_type'], True, method.height, method.width,
+                                                  npe=meta.get('npe')))
+            elif meta.get('model') == 'slim':
+                if slim_available():
+                    torch_methods.append(slim_torch(True, meta['variant'], meta['config'], meta['checkpoint']))
+                else:
+                    print(f'{path}: no SLiM torch reference outside the slim environment (pixi run -e slim ...)')
+                    torch_methods, method.reference = [], None
+        for m in torch_methods:
+            methods.setdefault(m.name, m)
         methods[method.name] = method
     if opt.paper:
         for method in (eloftr_torch('full', True, HEIGHT, WIDTH, thr=0.1, border_rm=0),
@@ -328,21 +362,22 @@ def run_matching(method, pairs, opt):
     return matches, np.array(times)
 
 
-def pair_metrics(index, kpts0, kpts1, pair, ransac_times):
+def pair_metrics(index, kpts0, kpts1, pair, ransac_times, ransac_thr):
     """Pose errors of `ransac_times` RANSAC runs on shuffled matches (seeded by the pair index) and the precision."""
     K, T_0to1 = pair['K'], pair['T_0to1']
     rng = np.random.default_rng(index)
     errors = []
     for _ in range(ransac_times):
         order = rng.permutation(len(kpts0))
-        errors.append(pose_error(kpts0[order], kpts1[order], K, K, T_0to1, RANSAC_THR, RANSAC_CONF))
+        errors.append(pose_error(kpts0[order], kpts1[order], K, K, T_0to1, ransac_thr, RANSAC_CONF))
     distances = symmetric_epipolar_distance(kpts0, kpts1, T_0to1, K, K)
     return errors, float((distances < EPI_THR).mean()) if len(distances) else 0.0
 
 
 def summarize(matches, times, pairs, opt):
     with ThreadPoolExecutor(opt.threads) as pool:  # OpenCV releases the GIL
-        results = list(pool.map(lambda i: pair_metrics(i, *matches[i], pairs[i], opt.ransac_times), range(len(pairs))))
+        results = list(pool.map(lambda i: pair_metrics(i, *matches[i], pairs[i], opt.ransac_times, opt.ransac_thr),
+                                range(len(pairs))))
     errors = np.array([e for r in results for e in r[0]])
     row = {f'auc@{t}': 100 * auc for t, auc in pose_auc(errors).items()}
     row['precision'] = 100 * float(np.mean([r[1] for r in results]))
@@ -406,6 +441,8 @@ def main():
                         help='ScanNet-1500 test images and poses, default: $DATASET_DIR/scannet.')
     parser.add_argument('--limit', type=int, default=None, help='Evaluate N evenly spaced pairs (quick check).')
     parser.add_argument('--ransac-times', type=int, default=5, help='RANSAC runs per pair on shuffled matches.')
+    parser.add_argument('--ransac-thr', type=float, default=0.5,
+                        help='RANSAC threshold in pixels (0.5 as EfficientLoFTR and LoFTR; SLiM reports 0.275).')
     parser.add_argument('--warmup', type=int, default=20, help='Warm-up iterations of each method on the first pair.')
     parser.add_argument('--cuda-graph', action='store_true', help='Run the TensorRT engines as CUDA graphs.')
     parser.add_argument('--workers', type=int, default=4, help='Image loading processes.')
@@ -433,7 +470,7 @@ def main():
 
     opt.out.mkdir(parents=True, exist_ok=True)
     report = opt.out / (f'scannet_{len(pairs)}.json' if opt.limit else 'scannet.json')
-    protocol = {'pairs': len(pairs), 'ransac_times': opt.ransac_times, 'ransac_thr_px': RANSAC_THR,
+    protocol = {'pairs': len(pairs), 'ransac_times': opt.ransac_times, 'ransac_thr_px': opt.ransac_thr,
                 'ransac_conf': RANSAC_CONF, 'epipolar_thr': EPI_THR, 'cuda_graph': opt.cuda_graph,
                 'gpu': torch.cuda.get_device_name()}
     report.write_text(json.dumps({'protocol': protocol, 'rows': rows}, indent=2))

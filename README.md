@@ -11,7 +11,7 @@ The code is based on the original [LoFTR](https://github.com/zju3dv/LoFTR) repos
 The repository uses [pixi](https://pixi.sh) (Python 3.11, PyTorch 2.9.1 and torchvision 0.24.1 with CUDA 12.8, TensorRT 10.9 from PyPI, CUDA 12 driver):
 ```
 pixi install
-pixi run init-submodules   # fetches third_party/EfficientLoFTR, third_party/LoMa and third_party/RoMaV2
+pixi run init-submodules   # fetches third_party/EfficientLoFTR, third_party/LoMa, third_party/RoMaV2 and third_party/SLiM
 ```
 
 torch and TensorRT match the `trt` environment of the tracker that consumes the engines; engines only load with the TensorRT version that built them. torch 2.9 exports ONNX with the dynamo exporter by default, so the export scripts pass `dynamo=False` (the TorchScript exporter the models were validated with), and since torch 2.6 loads checkpoints with `weights_only=True`, so trusted local checkpoints that pickle Python objects (Lightning checkpoints) are loaded with `weights_only=False`.
@@ -20,13 +20,13 @@ Datasets are stored under `DATASET_DIR`, set in `run/env.sh` (default `~/dataset
 
 ### Repository layout
 
-* `eloftr/`, `loftr_full/`: fixed-shape EfficientLoFTR and LoFTR for ONNX/TensorRT, the TensorRT runtime (`eloftr/trt_runtime.py`) and evaluation helpers (`eloftr/evaluation.py`, `eloftr/pose.py`).
+* `eloftr/`, `loftr_full/`, `slim/`: fixed-shape EfficientLoFTR, LoFTR and SLiM for ONNX/TensorRT, the TensorRT runtime (`eloftr/trt_runtime.py`), evaluation helpers (`eloftr/evaluation.py`, `eloftr/pose.py`) and SLiM's selective scan plugin (`slim/plugin`).
 * `loma_trt/`, `romav2_trt/`: fixed-shape LoMa and RoMa v2 (`upstream.py` loader, `static_model.py`, `evaluation.py` comparisons and engine smoke tests, `matcher.py`).
 * `loftr/`, `train/`: the legacy Coarse LoFTR model and its distillation training; shared helpers are in `loftr/utils/helpers.py`.
-* `scripts/trt/`: ONNX export and TensorRT engine building (`export_eloftr_onnx.py`, `export_loftr_onnx.py`, `export_loma_onnx.py`, `export_romav2_onnx.py`, legacy `export_onnx.py`, `build_trt_engine.py`).
+* `scripts/trt/`: ONNX export and TensorRT engine building (`export_eloftr_onnx.py`, `export_loftr_onnx.py`, `export_loma_onnx.py`, `export_romav2_onnx.py`, `export_slim_onnx.py`, legacy `export_onnx.py`, `build_trt_engine.py`).
 * `scripts/eval/`: benchmarks (`eval_eloftr.py` on the sample images, `eval_scannet.py` on ScanNet-1500).
 * `scripts/`: demos and training entry points (`match_eloftr.py`, `webcam.py`, `train_distill.py`, `compare.py`).
-* `run/`: shell scripts (`env.sh`, `download_scannet.sh`, `export_trt.sh`, `start_tensorboard.sh`).
+* `run/`: shell scripts (`env.sh`, `download_scannet.sh`, `export_trt.sh`, `build_slim_kernels.sh`, `build_slim_plugin.sh`, `start_tensorboard.sh`).
 
 Scripts import the packages from the repository root, which pixi puts on `PYTHONPATH`; run them from the root with `pixi run python scripts/...` (or set `PYTHONPATH=.` in another environment).
 
@@ -129,9 +129,38 @@ Other engines: `pixi run build-romav2-engine <height> <width> <fp16|bf16|fp32>`,
 
 On an RTX 3090 the fp16 engines take 24 ms (320x320), 34 ms (384x384) and 74 ms (640x480) per pair, against 49 ms and 63 ms for upstream's forward at 320x320 and 384x384 (timings on this GPU, which also drives a desktop, vary by up to 20% with its clock and temperature). Sampling 5000 matches with upstream's sampler adds 15.5 ms (its kernel density estimate compares 20000 candidates), 1000 matches 1.1 ms. ScanNet-1500 accuracy is that of upstream (within 0.3 AUC points, see [ScanNet benchmark](#scannet-benchmark)).
 
+### SLiM + TensorRT
+
+[SLiM](https://github.com/Band-127/SLiM) (CVPR 2026, MIT license) is included as an unmodified, pinned git submodule in `third_party/SLiM`, with its MegaDepth checkpoint. Its torch model needs mamba-ssm, causal-conv1d and VMamba's selective scan CUDA kernel, so it lives in a separate pixi environment `slim` (prebuilt mamba-ssm/causal-conv1d wheels; the kernel is compiled with the CUDA toolkit in `/usr/local/cuda-12.4`, set as `CUDA_HOME` in `pixi.toml`). The engines only need the plugin library and run in the default environment.
+
+```
+pixi run init-submodules
+pixi run -e slim build-slim-kernels          # VMamba's selective scan for SLiM's torch model, once
+pixi run -e slim build-slim-engine           # weights/slim/slim_indoor_mixed_480x640.engine (and the plugin)
+pixi run -e slim build-slim-engine fp32
+pixi run match <image0> <image1> --engine weights/slim/slim_indoor_mixed_480x640.engine
+```
+
+* `slim.static_model.StaticSLiM` is the fixed-shape version of SLiM's test inference at 640x480 with its `indoor_test` settings (up to 600 coarse and 4800 fine matches). The norm-based coarse candidates are masks, the flat top-k of the coarse dual softmax keeps 600 entries (computed exactly as the top-k of the 600 rows with the largest maxima, since a top-k over all 23M entries takes 75 ms in TensorRT), the per-window fine top-k keeps its maximum size with a validity mask, and the valid fine matches are compacted in upstream order into the 4800 refinement slots. Outputs are the same as for the other engines, so `ELoFTRMatcher` and `scripts/match_eloftr.py` run SLiM engines too.
+* The selective scan of SLiM's SS2D blocks is the TensorRT plugin `SelectiveScan` (`slim/plugin`, built by `pixi run -e slim build-slim-plugin` into `build/slim_plugin/libslim_trt_plugins.so` with the public headers of the installed TensorRT version). It compiles the unmodified upstream CUDA kernel without torch (small stand-ins for the c10 headers it includes) and gives bit-identical results to `selective_scan_cuda_oflex` in fp32 and fp16. Engine sidecars list the plugin library, which `eloftr.trt_runtime` loads before building or deserializing.
+* Mamba2 (two blocks on 1200 tokens) runs in plain ops (`slim/mamba2.py`); it matches mamba-ssm's reference implementation to ~1e-5, while mamba-ssm's fused kernel that SLiM's torch model uses is off by ~1e-3 relative (TF32), which moves ~0.6% of the matches.
+* `mixed` runs the convolutions and projections in fp16, and the scans, Mamba2's SSD, similarities, softmaxes, LayerNorms and the SSM parameters in fp32. `scripts/trt/export_slim_onnx.py` checks that `StaticSLiM` with mamba-ssm's kernels reproduces upstream SLiM exactly (Jaccard 0.999 on the sample pairs) before exporting.
+* TensorRT 10.9 computes a slice-and-concatenate of a stage output that the next stage also reads wrongly (it reads overwritten memory), so `StaticSLiM` converts between SLiM's side-by-side and batched layouts with reshapes and transposes instead.
+
+Results on ScanNet-1500 (`pixi run -e slim eval-scannet --engine weights/slim/*.engine`, RTX 4070 Ti SUPER, about 4780 matches per pair):
+
+| Model | AUC@5/10/20, RANSAC 0.5 px | AUC@5/10/20, RANSAC 0.275 px | Latency |
+|---|---|---|---|
+| SLiM torch fp32 (upstream kernels) | 14.04 / 28.31 / 42.82 | 13.51 / 27.50 / 41.79 | 67.8 ms |
+| SLiM torch AMP | 13.72 / 28.17 / 42.73 | 13.29 / 27.31 / 41.77 | 49.7 ms |
+| TensorRT fp32 | 13.68 / 27.99 / 42.55 | 13.20 / 27.18 / 41.62 | 71.8 ms |
+| TensorRT mixed | 13.89 / 28.49 / 43.25 | 13.35 / 27.47 / 42.05 | **27.1 ms** |
+
+The engines stay within 0.4 AUC points of the torch model, and the mixed engine is 1.8x faster than SLiM in AMP. SLiM's paper reports 18.0/34.7/50.4 on ScanNet with the same checkpoint and its 0.275 px threshold (`--ransac-thr 0.275`); its released code and config give 13.5/27.5/41.8 here with the same evaluation as for EfficientLoFTR, which reproduces its paper. The fp32 engine runs the convolutions without TF32 (the torch model uses TF32), hence its latency.
+
 ### ScanNet benchmark
 
-`scripts/eval/eval_scannet.py` measures relative pose accuracy and speed on ScanNet-1500 (`pixi run download-scannet` first) with the protocol of the upstream EfficientLoFTR test: images resized to 640x480, essential matrix by OpenCV RANSAC (0.5 px, confidence 0.99999) on 5 shuffles of the matches, AUC of the pose error max(rotation, translation angle) at 5/10/20 degrees, and precision as the fraction of matches with a symmetric epipolar distance below 5e-4. The metrics (`eloftr/pose.py`) reproduce upstream `src/utils/metrics.py`. It evaluates every engine in `weights/eloftr`, `weights/loftr`, `weights/loma`, `weights/romav2` and the legacy `weights/LoFTR_teacher.engine`, each next to the torch model it was exported from at the same input size and matching settings, and checks that every engine stays within 1 AUC point and 3% of the match count of its torch model.
+`scripts/eval/eval_scannet.py` measures relative pose accuracy and speed on ScanNet-1500 (`pixi run download-scannet` first) with the protocol of the upstream EfficientLoFTR test: images resized to 640x480, essential matrix by OpenCV RANSAC (0.5 px, confidence 0.99999) on 5 shuffles of the matches, AUC of the pose error max(rotation, translation angle) at 5/10/20 degrees, and precision as the fraction of matches with a symmetric epipolar distance below 5e-4. The metrics (`eloftr/pose.py`) reproduce upstream `src/utils/metrics.py`. It evaluates every engine in `weights/eloftr`, `weights/loftr`, `weights/loma`, `weights/romav2`, `weights/slim` and the legacy `weights/LoFTR_teacher.engine`, each next to the torch model it was exported from (SLiM's only in the `slim` environment) at the same input size and matching settings, and checks that every engine stays within 1 AUC point and 3% of the match count of its torch model.
 
 ```
 pixi run eval-scannet                 # all engines and their torch models, report in outputs/eval/scannet.json

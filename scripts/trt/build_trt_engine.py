@@ -7,7 +7,7 @@ from pathlib import Path
 import tensorrt as trt
 import torch
 
-from eloftr import sidecar_path
+from eloftr import plugin_paths, sidecar_path
 from eloftr.trt_runtime import TRTEngine, build_engine
 
 # Models with their own output contract and smoke test (engine vs the torch static model at the same precision)
@@ -15,8 +15,12 @@ SMOKE_TESTS = {'loma': 'loma_trt.evaluation', 'romav2': 'romav2_trt.evaluation'}
 
 
 def reference_model(meta):
-    """Torch model (StaticLoFTR or StaticELoFTR) the ONNX model was exported from, at its precision."""
+    """Torch model (StaticLoFTR, StaticSLiM or StaticELoFTR) the ONNX model was exported from, at its precision."""
     height, width, groups = meta['height'], meta['width'], meta['fp16_groups']
+    if meta.get('model') == 'slim':
+        from slim.static_model import StaticSLiM
+        from slim.upstream import load_upstream
+        return StaticSLiM(load_upstream(meta['checkpoint'], meta['config']), height, width, groups)
     if meta.get('model') == 'loftr':
         from loftr_full.static_model import StaticLoFTR
         from loftr_full.upstream import load_upstream
@@ -30,10 +34,12 @@ def reference_model(meta):
 def smoke_test(engine_path, meta, num_pairs=4):
     """Compare the engine with the torch model at the same precision."""
     from eloftr.evaluation import compare, load_gray, sample_pairs, static_matches, summarize, to_tensor
+    if meta.get('model') == 'slim':  # several matches per coarse cell
+        from slim.evaluation import compare, static_matches
 
     height, width = meta['height'], meta['width']
     model = reference_model(meta).cuda().eval()
-    engine = TRTEngine(engine_path)
+    engine = TRTEngine(engine_path, plugins=plugin_paths(meta))
     results = []
     for path0, path1 in sample_pairs()[:num_pairs]:
         image0, image1 = (to_tensor(load_gray(p, height, width)) for p in (path0, path1))
@@ -74,7 +80,7 @@ def main():
     started = time.perf_counter()
     build_engine(opt.onnx, engine_path, strongly_typed=not opt.fp16, fp16=opt.fp16, tf32=opt.tf32,
                  workspace_gib=opt.workspace_gib, opt_level=opt.opt_level, timing_cache=timing_cache,
-                 verbose=opt.verbose)
+                 verbose=opt.verbose, plugins=plugin_paths(meta))
     meta.update({'onnx': str(opt.onnx), 'tensorrt': trt.__version__, 'strongly_typed': not opt.fp16,
                  'fp16_flag': opt.fp16, 'tf32': opt.tf32, 'opt_level': opt.opt_level,
                  'gpu': torch.cuda.get_device_name(), 'build_seconds': round(time.perf_counter() - started, 1)})
@@ -83,7 +89,7 @@ def main():
     if not opt.skip_check:
         if meta.get('model') in SMOKE_TESTS:
             meta['smoke_test'] = importlib.import_module(SMOKE_TESTS[meta['model']]).smoke_test(engine_path, meta)
-        elif 'fp16_groups' in meta:  # sidecar of an exported EfficientLoFTR or LoFTR model
+        elif 'fp16_groups' in meta:  # sidecar of an exported EfficientLoFTR, LoFTR or SLiM model
             meta['smoke_test'] = smoke_test(engine_path, meta)
     sidecar_path(engine_path).write_text(json.dumps(meta, indent=2))
 
